@@ -1,0 +1,188 @@
+// Original work:
+/*
+Copyright (c) 2015 Princeton University
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * Neither the name of Princeton University nor the
+      names of its contributors may be used to endorse or promote products
+      derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY PRINCETON UNIVERSITY "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL PRINCETON UNIVERSITY BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+
+// Modifications: 
+/*
+ * Copyright (c) 2026 Tampere University
+ * Licensed under the Solderpad Hardware License v 2.1, see LICENSE for details.
+ * SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
+ */
+
+//==================================================================================================
+//  Filename        : rsp_buffer (original noc3buffer)
+//  Original Author : Tri Nguyen, trin@princeton.edu, Princeton University
+//  Modified        : Teemu Rinne, Tampere University
+//
+//  Description     : response buffer of AMBA CHI based RN-F coherent cache
+//
+//==================================================================================================
+
+`include "l15.tmp.h"
+`include "define.tmp.h"
+`include "chie_defines.v"
+
+`ifdef DEFAULT_NETTYPE_NONE
+`default_nettype none // DEFAULT_NETTYPE_NONE
+`endif
+module rx_buffer(
+    input wire clk,
+    input wire rst_n,
+
+    input wire l15_noc3encoder_req_val,
+    input wire [`L15_NOC3_REQTYPE_WIDTH-1:0] l15_noc3encoder_req_type,
+    // Modified 64B L15: full 512b writeback/snoop-data line in a single port
+    // (replaces the prior 2x64b sub-block ports data_0/data_1).
+    input wire [511:0] l15_noc3encoder_req_data,
+    input wire [`L15_MSHR_ID_WIDTH-1:0] l15_noc3encoder_req_mshrid,
+    input wire [`L15_THREADID_MASK] l15_noc3encoder_req_threadid,
+    input wire [1:0] l15_noc3encoder_req_sequenceid,
+    input wire [39:0] l15_noc3encoder_req_address,
+    input wire l15_noc3encoder_req_with_data,
+    input wire l15_noc3encoder_req_was_inval,
+    input wire [3:0] l15_noc3encoder_req_fwdack_vector,
+    input wire [`L15_MESI_STATE_WIDTH-1:0] l15_noc3buffer_req_prev_mesi,
+    input wire [`PACKET_HOME_ID_WIDTH-1:0] l15_noc3encoder_req_homeid,
+    input wire [`CHIE_SNP_FLIT_TXNID_WIDTH-1:0] l15_noc3encoder_req_rxsnp_txnid,
+
+    output reg noc3buffer_noc3encoder_req_val,
+    output reg [`L15_NOC3_REQTYPE_WIDTH-1:0] noc3buffer_noc3encoder_req_type,
+    // Single 512b aggregate forwarded to the response_encoder.
+    output reg [511:0] noc3buffer_noc3encoder_req_data,
+    output reg [`L15_MSHR_ID_WIDTH-1:0] noc3buffer_noc3encoder_req_mshrid,
+    output reg [1:0] noc3buffer_noc3encoder_req_sequenceid,
+    output reg [`L15_THREADID_MASK] noc3buffer_noc3encoder_req_threadid,
+    output reg [39:0] noc3buffer_noc3encoder_req_address,
+    output reg noc3buffer_noc3encoder_req_with_data,
+    output reg noc3buffer_noc3encoder_req_was_inval,
+    output reg [3:0] noc3buffer_noc3encoder_req_fwdack_vector,
+    output reg [`PACKET_HOME_ID_WIDTH-1:0] noc3buffer_noc3encoder_req_homeid,
+    output reg [`L15_MESI_STATE_WIDTH-1:0] noc3buffer_rspencoder_req_prev_mesi,
+    output reg [`CHIE_SNP_FLIT_TXNID_WIDTH-1:0] noc3buffer_noc3encoder_req_rxsnp_txnid,
+
+
+    input wire noc3encoder_noc3buffer_req_ack,
+    output reg noc3buffer_l15_req_ack
+
+   );
+
+
+// reg l15_noc3encoder_req_val_buf;
+reg buffer_val;
+reg buffer_val_next;
+reg new_buffer;
+reg [`L15_NOC3_REQTYPE_WIDTH-1:0] l15_noc3encoder_req_type_buf;
+// Single 512b line buffer (replaces the prior 2x64b data_0/data_1 buffers).
+reg [511:0] l15_noc3encoder_req_data_buf;
+reg [`L15_MSHR_ID_WIDTH-1:0] l15_noc3encoder_req_mshrid_buf;
+reg [1:0] l15_noc3encoder_req_threadid_buf;
+reg [1:0] l15_noc3encoder_req_sequenceid_buf;
+reg [39:0] l15_noc3encoder_req_address_buf;
+reg l15_noc3encoder_req_with_data_buf;
+reg l15_noc3encoder_req_was_inval_buf;
+reg [3:0] l15_noc3encoder_req_fwdack_vector_buf;
+reg [`PACKET_HOME_ID_WIDTH-1:0] l15_noc3encoder_req_homeid_buf;
+reg [`L15_MESI_STATE_WIDTH-1:0] l15_noc3buffer_req_prev_mesi_buf;
+reg [`CHIE_SNP_FLIT_TXNID_WIDTH-1:0] l15_noc3encoder_req_rxsnp_txnid_buf;
+
+always @ (posedge clk)
+begin
+    if (!rst_n)
+    begin
+        buffer_val <= 1'b0;
+    end
+    else
+    begin
+        buffer_val <= buffer_val_next;
+        if (new_buffer)
+        begin
+            l15_noc3encoder_req_type_buf <= l15_noc3encoder_req_type;
+            l15_noc3encoder_req_data_buf <= l15_noc3encoder_req_data;
+            l15_noc3encoder_req_mshrid_buf <= l15_noc3encoder_req_mshrid;
+            l15_noc3encoder_req_threadid_buf <= l15_noc3encoder_req_threadid;
+            l15_noc3encoder_req_sequenceid_buf <= l15_noc3encoder_req_sequenceid;
+            l15_noc3encoder_req_address_buf <= l15_noc3encoder_req_address;
+            l15_noc3encoder_req_with_data_buf <= l15_noc3encoder_req_with_data;
+            l15_noc3encoder_req_was_inval_buf <= l15_noc3encoder_req_was_inval;
+            l15_noc3encoder_req_fwdack_vector_buf <= l15_noc3encoder_req_fwdack_vector;
+            l15_noc3encoder_req_homeid_buf <= l15_noc3encoder_req_homeid;
+            l15_noc3buffer_req_prev_mesi_buf <= l15_noc3buffer_req_prev_mesi;
+            l15_noc3encoder_req_rxsnp_txnid_buf <= l15_noc3encoder_req_rxsnp_txnid;
+        end
+    end
+end
+
+always @ *
+begin
+    noc3buffer_noc3encoder_req_val = buffer_val;
+    noc3buffer_noc3encoder_req_type = l15_noc3encoder_req_type_buf;
+    noc3buffer_noc3encoder_req_data = l15_noc3encoder_req_data_buf;
+    noc3buffer_noc3encoder_req_mshrid = l15_noc3encoder_req_mshrid_buf;
+    noc3buffer_noc3encoder_req_threadid = l15_noc3encoder_req_threadid_buf;
+    noc3buffer_noc3encoder_req_sequenceid = l15_noc3encoder_req_sequenceid_buf;
+    noc3buffer_noc3encoder_req_address = l15_noc3encoder_req_address_buf;
+    noc3buffer_noc3encoder_req_with_data = l15_noc3encoder_req_with_data_buf;
+    noc3buffer_noc3encoder_req_was_inval = l15_noc3encoder_req_was_inval_buf;
+    noc3buffer_noc3encoder_req_fwdack_vector = l15_noc3encoder_req_fwdack_vector_buf;
+    noc3buffer_noc3encoder_req_homeid = l15_noc3encoder_req_homeid_buf;
+    noc3buffer_rspencoder_req_prev_mesi = l15_noc3buffer_req_prev_mesi_buf;
+    noc3buffer_noc3encoder_req_rxsnp_txnid = l15_noc3encoder_req_rxsnp_txnid_buf;
+end
+
+// val/ack logic
+
+// buffer_l15_ack is 1 only when req is valid, and buffer_val is 0 or noc3encoder_ack is 1
+// ie buffer_l15_ack = l15_req && (!buffer_val || noc3encoder_ack);
+// case 1: buffer not valid, accepting new req
+// case 2: buffer is valid, but accepting new req because noc3 is done with current buffer
+
+// logic for accepting new req: buffer_l15_ack
+
+// buffer_val_next
+// = 1 when buffer_l15_ack
+// else = 0 when noc3encoder_ack
+// else = buffer_val
+
+always @ *
+begin
+    noc3buffer_l15_req_ack = 1'b0;
+    if (l15_noc3encoder_req_val && (!buffer_val || noc3encoder_noc3buffer_req_ack))
+        noc3buffer_l15_req_ack = 1'b1;
+
+    new_buffer = noc3buffer_l15_req_ack;
+
+    buffer_val_next = 1'b0;
+    if (noc3buffer_l15_req_ack)
+        buffer_val_next = 1'b1;
+    else if (noc3encoder_noc3buffer_req_ack)
+        buffer_val_next = 1'b0;
+    else
+        buffer_val_next = buffer_val;
+end
+
+endmodule

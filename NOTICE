@@ -1,0 +1,51 @@
+CHI-RNF — An Open-Source AMBA CHI E.b Fully-Coherent Request Node
+
+Copyright 2026 Tampere University
+Customized Parallel Computing (CPC) Group
+
+Licensed under the Solderpad Hardware License v2.1; see LICENSE.
+SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
+
+Solderpad v2.1 permits treating any work released under it as released
+under the Apache License v2.0.  Accordingly, the non-hardware files in
+this repository -- generators, run scripts, Questa .do scripts and Murphi
+models -- carry a plain Apache-2.0 header, which is consistent with, not
+an exception to, the licence above.
+
+Per-file headers are authoritative.  Where a file states its own licence,
+that statement governs.
+
+
+THIRD-PARTY AND DERIVED COMPONENTS
+----------------------------------
+
+This repository bundles or derives from the following works, each under
+its own licence.  The Solderpad licence above does not extend to them.
+
+  cva6-RNF/openpiton/            OpenPiton (submodule)
+                                 Princeton University and contributors.
+                                 Includes the CVA6 core and the CVA6
+                                 package chain.  See the headers and
+                                 licence files within the submodule.
+
+  cva6-RNF/cache/                Contains 19 files derived from OpenPiton
+  cva6-RNF/src/                  and OpenSPARC T1, Copyright (c) 2015
+                                 Princeton University, BSD-3-Clause.
+                                 Among them: rx_decoder.v, req_buffer.v,
+                                 rsp_buffer.v, network_define.v,
+                                 lsu.tmp.h.  Each retains its original
+                                 notice as BSD-3-Clause requires.
+
+  cva6-RNF/tb/rnf_top.sv         Copyright (c) 2015 Princeton University,
+                                 BSD-3-Clause.
+
+  cva6-RNF/opennoc/              OpenNoC interconnect RTL.
+                                 Copyright (c) 2024 Beijing Institute of
+                                 Open Source Chip.  Mulan PSL v2.
+                                 http://license.coscl.org.cn/MulanPSL2
+
+  cva6-RNF/common_cells/         PULP platform common cells.
+  cva6-RNF/axi2mem/              Solderpad Hardware License v0.51.
+
+Redistributing this repository requires retaining the notices above and
+the per-file notices they refer to.

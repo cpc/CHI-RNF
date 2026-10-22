@@ -1,0 +1,80 @@
+# rnf_ip_flist -- compile list for the RN-F IP-level testbench.
+#
+# DUT scope: cache/rnf_cache (RN-F coherence FSM, formerly cache/l15)
+# + cache/rnf_link (CHI flit pack/unpack).  CVA6 core, OpenPiton
+# routing, gem5 co-sim and the full chipset are all excluded; the HN-F
+# counterparty is the abstract responder in tb/chi_hnf_responder.sv.
+#
+# Rebuilt after the 2026-09 restructure, which moved cache/l15/rtl ->
+# cache/rnf_cache with renamed modules (l15_rnf_pipeline -> rnf_pipeline,
+# l15_mshr -> rnf_mshr, rf_l15_* -> rf_rnf_*), deleted the CSM subtree
+# and the NOC buffers, and relocated the CVA6 package chain into the
+# openpiton submodule.  Paths cross-checked against tb/chi_flist.
+#
+# Compile from tb/questa_build/ via:
+#   vlog -f ../rnf_ip_flist
+#
+# PROJ_ROOT is the repo root (parent of cva6-RNF/).
+
+# ── Include paths ───────────────────────────────────────────────────
++incdir+$PROJ_ROOT/cva6-RNF/cache/include
++incdir+$PROJ_ROOT/cva6-RNF/opennoc/rtl/include
++incdir+$PROJ_ROOT/cva6-RNF/openpiton/piton/design/chip/tile/ariane/common/submodules/common_cells/include/
++incdir+$PROJ_ROOT/cva6-RNF/openpiton/piton/design/chip/tile/ariane/common/local/util/
++incdir+$PROJ_ROOT/cva6-RNF/openpiton/piton/design/chip/tile/ariane/corev_apu/register_interface/include/
+
+# ── CVA6 package chain (config -> riscv -> dm -> ariane -> wt_cache) ─
+# The RN-F does not instantiate the core, but rx_control.sv,
+# request_register.sv and response_encoder.sv import wt_cache_pkg, and
+# wt_cache_pkg references ariane_pkg:: for its cache geometry.  These
+# packages now live inside the openpiton submodule.
+$PROJ_ROOT/cva6-RNF/openpiton/piton/design/chip/tile/ariane/core/include/cv64a6_imafdc_sv39_openpiton_config_pkg.sv
+-mixedsvvh $PROJ_ROOT/cva6-RNF/openpiton/piton/design/chip/tile/ariane/core/include/riscv_pkg.sv
+$PROJ_ROOT/cva6-RNF/openpiton/piton/design/chip/tile/ariane/corev_apu/riscv-dbg/src/dm_pkg.sv
+-mixedsvvh $PROJ_ROOT/cva6-RNF/openpiton/piton/design/chip/tile/ariane/core/include/ariane_pkg.sv
+$PROJ_ROOT/cva6-RNF/cache/include/wt_cache_pkg.sv
+
+# ── Headers ─────────────────────────────────────────────────────────
+# config.v / define.tmp.h / l15.tmp.h / lsu.tmp.h carry the OpenPiton
+# macro set the cache RTL expands (L1D_WAY_MASK, PCX/CPX field widths,
+# MESI encodings).  Order follows tb/chi_flist.
+$PROJ_ROOT/cva6-RNF/cache/include/config.v
+$PROJ_ROOT/cva6-RNF/cache/include/define.tmp.h
+$PROJ_ROOT/cva6-RNF/cache/include/l15.tmp.h
+$PROJ_ROOT/cva6-RNF/cache/include/lsu.tmp.h
+$PROJ_ROOT/cva6-RNF/cache/include/rnf_param.v
+$PROJ_ROOT/cva6-RNF/cache/include/rnf_defines.v
+$PROJ_ROOT/cva6-RNF/cache/include/chie_defines.v
+
+# ── rnf_link (CHI flit pack/unpack) ─────────────────────────────────
+-sv $PROJ_ROOT/cva6-RNF/cache/rnf_link/rnf_link_txdat_wrap.v
+-sv $PROJ_ROOT/cva6-RNF/cache/rnf_link/rnf_link_rxdat_parse.v
+-sv $PROJ_ROOT/cva6-RNF/cache/rnf_link/rnf_link_txrsp_wrap.v
+-sv $PROJ_ROOT/cva6-RNF/cache/rnf_link/rnf_link_rxrsp_parse.v
+-sv $PROJ_ROOT/cva6-RNF/cache/rnf_link/rnf_link_txreq_wrap.v
+-sv $PROJ_ROOT/cva6-RNF/cache/rnf_link/rnf_link_rxsnp_parse.v
+-sv $PROJ_ROOT/cva6-RNF/cache/rnf_link/rnf_link_handshake_ctl.v
+-sv $PROJ_ROOT/cva6-RNF/cache/rnf_link/rnf_link.v
+
+# ── RN-F cache (coherence FSM) ──────────────────────────────────────
+# rnf_pipeline.v and rnf_pipeline_16B.v BOTH declare `module
+# rnf_pipeline`; only one may be compiled.  chi_flist selects the
+# 64B variant, so this does too.
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/rnf_cache_wrap.v
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/rnf_cache.v
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/rnf_pipeline.v
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/txreq_encoder.v
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/response_encoder.sv
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/request_register.sv
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/rx_control.sv
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/rnf_mshr.v
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/rf_rnf_lrsc_flag.v
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/rf_rnf_wmt.v
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/rf_rnf_lruarray.v
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/rf_rnf_mesi.v
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/rx_decoder.v
+# rsp_buffer.v declares `module rx_buffer` -- file and module names differ.
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/rsp_buffer.v
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/req_buffer.v
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/sram_wrappers/sram_rnf_tag.v
+$PROJ_ROOT/cva6-RNF/cache/rnf_cache/sram_wrappers/sram_rnf_data.v

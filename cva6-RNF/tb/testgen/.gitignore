@@ -1,0 +1,21 @@
+# ── Generated data ────────────────────────────────────────────────────
+# Convergence curves, coverage tables and run logs are all reproducible
+# from the generators + run_convergence.sh.  Curated result files that
+# are worth versioning are already tracked; git keeps tracking those, so
+# these patterns only affect NEW files.  Use `git add -f` to add one.
+*.csv
+*.txt
+
+# ── Generated vector sets and sweep logs ─────────────────────────────
+vectors_*/
+run_*_logs/
+.conv_*/
+
+# ── Murphi build products (rumur output + compiled verifiers) ────────
+murphi*/*_fsm
+murphi*/*_fsm_v[0-9]
+murphi*/*.c
+__pycache__/
+
+# ── Coverage databases ───────────────────────────────────────────────
+*.ucdb

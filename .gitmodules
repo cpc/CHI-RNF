@@ -1,0 +1,15 @@
+[submodule "cva6-RNF/openpiton"]
+	path = cva6-RNF/openpiton
+	url = https://github.com/PrincetonUniversity/openpiton.git
+[submodule "cva6-RNF/sw/riscv-benchmarks"]
+	path = cva6-RNF/sw/riscv-benchmarks
+	url = https://github.com/ucb-bar/riscv-benchmarks
+[submodule "cva6-RNF/opennoc"]
+	path = cva6-RNF/opennoc
+	url = https://github.com/RV-BOSC/OpenNoC
+[submodule "cva6-RNF/common_cells"]
+	path = cva6-RNF/common_cells
+	url = https://github.com/pulp-platform/common_cells
+[submodule "cva6-RNF/axi2mem"]
+	path = cva6-RNF/axi2mem
+	url = https://github.com/pulp-platform/axi_mem_if.git

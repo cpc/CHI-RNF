@@ -1,0 +1,836 @@
+# HN-F Coherence FSM — hand-curated subset for the test-case generator.
+#
+# Model: a single cache line, two RN-Fs (A, B). States encode the HN-F's
+# view of the line + ownership. Transients capture mid-transaction state
+# (snoop pending, SNF fill pending, CompAck pending). Each edge is one
+# input event the HN-F observes — either an RN-F-issued REQ (event prefix
+# REQ_A_ / REQ_B_) or an internal completion (SNF_DATA, SNP_RESP_*,
+# COMPACK_*).
+#
+# ── RTL provenance ─────────────────────────────────────────────────────
+# Snoop opcode emission table is per
+# cva6-RNF/opennoc/rtl/src/hnf/hnf_mshr_ctl.v:1963-1987:
+#
+#   REQ                  →   Snoop emitted
+#   ──────────────────────────────────────────
+#   ReadOnce             →   SnpOnce
+#   ReadUnique  (L3 miss)→   SnpUnique
+#   ReadUnique  (L3 hit) →   SnpMakeInvalid
+#   ReadNotSharedDirty   →   SnpNotSharedDirty
+#   ReadClean            →   SnpClean
+#   WriteUniquePtl       →   SnpUnique
+#   WriteUniqueFull      →   SnpMakeInvalid
+#   CleanShared          →   SnpCleanShared
+#   CleanUnique          →   SnpCleanInvalid
+#   CleanInvalid         →   SnpCleanInvalid
+#   MakeUnique           →   SnpMakeInvalid
+#
+# With DCT (Direct Cache Transfer) enabled, the opcode emitted is
+# +0x10 above (Fwd variant: SnpCleanFwd 0x12, SnpUniqueFwd 0x17, etc.) —
+# hnf_mshr_ctl.v:2991. The model does not distinguish DCT/non-DCT today.
+#
+# Snoop-filter state encoding (hnf_defines.v:85-87) — per RN-F:
+#   SF_I = 2'b00 (Invalid)        ← maps to "I" in this model
+#   SF_U = 2'b01 (Unique)         ← maps to UC_*/UD_* in this model
+#   SF_S = 2'b11 (Shared)         ← maps to SC_* in this model
+#   2'b10 is illegal (HNF $fatal in cache_pipeline.v:2294)
+#
+# Bypass classification (hnf_mshr_bypass.v:186-193): these REQs DO NOT
+# allocate a regular MSHR slot (mshr_alloc_en_s1_q never fires) — they
+# take a fast path that returns DBIDResp/Comp directly. Marked in actions
+# with the "(BYPASS)" tag so the oracle/observer know not to expect an
+# ALLOC line on hnf_mshr_ctl for these.
+#
+#   req_cb_s0  : WriteBackFull, WriteEvictFull, WriteCleanFull
+#   req_rd_s0  : ReadOnce, ReadNoSnp
+#   req_wrnosnp_s0: WriteNoSnpFull, WriteNoSnpPtl
+#
+# Stable line states:
+#   I       invalid (no RN-F caches it)
+#   SC_A    Shared-Clean, A is the (sole) sharer
+#   SC_B    Shared-Clean, B is the (sole) sharer
+#   SC_AB   Shared-Clean, both A and B
+#   UC_A    Unique-Clean held by A
+#   UC_B    Unique-Clean held by B
+#   UD_A    Unique-Dirty held by A
+#   UD_B    Unique-Dirty held by B
+#
+# Transient states (MSHR active; carry requester id in the name):
+#   T_FILL_A      awaiting ReadNoSnp data from SNF, requester=A
+#   T_FILL_B      same, requester=B
+#   T_SNP_A       snoops sent to peer(s), awaiting SnpResp, requester=A
+#   T_SNP_B       same, requester=B
+#   T_ACK_A       Comp/CompData sent, awaiting CompAck from A
+#   T_ACK_B       same, B
+#
+# ── CAM-hazard handling (see hnf_mshr_bypass.v:400, rxreq_cam_hazard_s1_q)
+# When a new REQ arrives for a line whose MSHR is already busy (i.e. the
+# HNF is in one of the transient states above for that line), the HNF
+# detects via the CAM hazard and either:
+#   (a) sends RetryAck if the incoming REQ has AllowRetry=1 (default in
+#       chi_tlm_rnf), forcing the requester to wait for PCrdGrant and
+#       re-issue, OR
+#   (b) stalls the new REQ in a holding slot if AllowRetry=0, releasing
+#       it after the in-flight MSHR retires.
+#
+# Modelled below as self-loop edges on each transient state with the
+# action prefix "CAM_HAZARD:" so coverage / oracle can identify them.
+# Exercising these in sim requires concurrent REQ arrival inside the
+# transient window — only the cross-burst (FORK/JOIN) mechanism reaches
+# this; sequential do_*() helpers block too tightly to overlap.
+
+initial: I
+
+states:
+  # ---------- stable ----------
+  I:        { transient: false }
+  SC_A:     { transient: false }
+  SC_B:     { transient: false }
+  SC_AB:   { transient: false }
+  UC_A:    { transient: false }
+  UC_B:    { transient: false }
+  UD_A:    { transient: false }
+  UD_B:    { transient: false }
+  # ---------- transient ----------
+  T_FILL_A: { transient: true }
+  T_FILL_B: { transient: true }
+  T_SNP_A:  { transient: true }
+  T_SNP_B:  { transient: true }
+  T_ACK_A:  { transient: true }
+  T_ACK_B:  { transient: true }
+
+# Event categories:
+#   REQ_<X>_<OP>   issued by RN-F X (driver-controllable)
+#   SNF_DATA       SNF returned ReadNoSnp data    (internal)
+#   SNP_RESP_X_<R> SnpResp from RN-F X with resp R  (driver-controllable: peer must respond)
+#   COMPACK_X      CompAck from RN-F X            (driver-controllable)
+#
+# `action` is a short string the runner will use to predict expected HNF
+# output flits — informational for the BFS, used by the oracle.
+
+  # ── auto-generated pending-state expansion (expand_hazards.py) ──
+  I__PEND_A_CleanInvalid:                                                { transient: false }
+  I__PEND_A_CleanShared:                                                 { transient: false }
+  I__PEND_A_CleanUnique:                                                 { transient: false }
+  I__PEND_A_MakeUnique:                                                  { transient: false }
+  I__PEND_A_ReadClean:                                                   { transient: false }
+  I__PEND_A_ReadNoSnp:                                                   { transient: false }
+  I__PEND_A_ReadUnique:                                                  { transient: false }
+  I__PEND_A_WriteBackFull:                                               { transient: false }
+  I__PEND_A_WriteCleanFull:                                              { transient: false }
+  I__PEND_A_WriteNoSnpFull:                                              { transient: false }
+  I__PEND_B_CleanInvalid:                                                { transient: false }
+  I__PEND_B_CleanShared:                                                 { transient: false }
+  I__PEND_B_CleanUnique:                                                 { transient: false }
+  I__PEND_B_MakeUnique:                                                  { transient: false }
+  I__PEND_B_ReadClean:                                                   { transient: false }
+  I__PEND_B_ReadNoSnp:                                                   { transient: false }
+  I__PEND_B_ReadUnique:                                                  { transient: false }
+  I__PEND_B_WriteBackFull:                                               { transient: false }
+  I__PEND_B_WriteCleanFull:                                              { transient: false }
+  I__PEND_B_WriteNoSnpFull:                                              { transient: false }
+  SC_AB__PEND_A_CleanInvalid:                                            { transient: false }
+  SC_AB__PEND_A_CleanShared:                                             { transient: false }
+  SC_AB__PEND_A_CleanUnique:                                             { transient: false }
+  SC_AB__PEND_A_MakeUnique:                                              { transient: false }
+  SC_AB__PEND_A_ReadClean:                                               { transient: false }
+  SC_AB__PEND_A_ReadNoSnp:                                               { transient: false }
+  SC_AB__PEND_A_ReadUnique:                                              { transient: false }
+  SC_AB__PEND_A_WriteBackFull:                                           { transient: false }
+  SC_AB__PEND_A_WriteCleanFull:                                          { transient: false }
+  SC_AB__PEND_A_WriteNoSnpFull:                                          { transient: false }
+  SC_AB__PEND_B_CleanInvalid:                                            { transient: false }
+  SC_AB__PEND_B_CleanShared:                                             { transient: false }
+  SC_AB__PEND_B_CleanUnique:                                             { transient: false }
+  SC_AB__PEND_B_MakeUnique:                                              { transient: false }
+  SC_AB__PEND_B_ReadClean:                                               { transient: false }
+  SC_AB__PEND_B_ReadNoSnp:                                               { transient: false }
+  SC_AB__PEND_B_ReadUnique:                                              { transient: false }
+  SC_AB__PEND_B_WriteBackFull:                                           { transient: false }
+  SC_AB__PEND_B_WriteCleanFull:                                          { transient: false }
+  SC_AB__PEND_B_WriteNoSnpFull:                                          { transient: false }
+  SC_A__PEND_B_CleanInvalid:                                             { transient: false }
+  SC_A__PEND_B_CleanShared:                                              { transient: false }
+  SC_A__PEND_B_CleanUnique:                                              { transient: false }
+  SC_A__PEND_B_MakeUnique:                                               { transient: false }
+  SC_A__PEND_B_ReadClean:                                                { transient: false }
+  SC_A__PEND_B_ReadNoSnp:                                                { transient: false }
+  SC_A__PEND_B_ReadUnique:                                               { transient: false }
+  SC_A__PEND_B_WriteBackFull:                                            { transient: false }
+  SC_A__PEND_B_WriteCleanFull:                                           { transient: false }
+  SC_A__PEND_B_WriteNoSnpFull:                                           { transient: false }
+  SC_B__PEND_A_CleanInvalid:                                             { transient: false }
+  SC_B__PEND_A_CleanShared:                                              { transient: false }
+  SC_B__PEND_A_CleanUnique:                                              { transient: false }
+  SC_B__PEND_A_MakeUnique:                                               { transient: false }
+  SC_B__PEND_A_ReadClean:                                                { transient: false }
+  SC_B__PEND_A_ReadNoSnp:                                                { transient: false }
+  SC_B__PEND_A_ReadUnique:                                               { transient: false }
+  SC_B__PEND_A_WriteBackFull:                                            { transient: false }
+  SC_B__PEND_A_WriteCleanFull:                                           { transient: false }
+  SC_B__PEND_A_WriteNoSnpFull:                                           { transient: false }
+  T_ACK_A__PEND_B_CleanInvalid:                                          { transient: true }
+  T_ACK_A__PEND_B_CleanShared:                                           { transient: true }
+  T_ACK_A__PEND_B_CleanUnique:                                           { transient: true }
+  T_ACK_A__PEND_B_MakeUnique:                                            { transient: true }
+  T_ACK_A__PEND_B_ReadClean:                                             { transient: true }
+  T_ACK_A__PEND_B_ReadNoSnp:                                             { transient: true }
+  T_ACK_A__PEND_B_ReadUnique:                                            { transient: true }
+  T_ACK_A__PEND_B_WriteBackFull:                                         { transient: true }
+  T_ACK_A__PEND_B_WriteCleanFull:                                        { transient: true }
+  T_ACK_A__PEND_B_WriteNoSnpFull:                                        { transient: true }
+  T_ACK_B__PEND_A_CleanInvalid:                                          { transient: true }
+  T_ACK_B__PEND_A_CleanShared:                                           { transient: true }
+  T_ACK_B__PEND_A_CleanUnique:                                           { transient: true }
+  T_ACK_B__PEND_A_MakeUnique:                                            { transient: true }
+  T_ACK_B__PEND_A_ReadClean:                                             { transient: true }
+  T_ACK_B__PEND_A_ReadNoSnp:                                             { transient: true }
+  T_ACK_B__PEND_A_ReadUnique:                                            { transient: true }
+  T_ACK_B__PEND_A_WriteBackFull:                                         { transient: true }
+  T_ACK_B__PEND_A_WriteCleanFull:                                        { transient: true }
+  T_ACK_B__PEND_A_WriteNoSnpFull:                                        { transient: true }
+  T_FILL_A__PEND_B_CleanInvalid:                                         { transient: true }
+  T_FILL_A__PEND_B_CleanShared:                                          { transient: true }
+  T_FILL_A__PEND_B_CleanUnique:                                          { transient: true }
+  T_FILL_A__PEND_B_MakeUnique:                                           { transient: true }
+  T_FILL_A__PEND_B_ReadClean:                                            { transient: true }
+  T_FILL_A__PEND_B_ReadNoSnp:                                            { transient: true }
+  T_FILL_A__PEND_B_ReadUnique:                                           { transient: true }
+  T_FILL_A__PEND_B_WriteBackFull:                                        { transient: true }
+  T_FILL_A__PEND_B_WriteCleanFull:                                       { transient: true }
+  T_FILL_A__PEND_B_WriteNoSnpFull:                                       { transient: true }
+  T_FILL_B__PEND_A_CleanInvalid:                                         { transient: true }
+  T_FILL_B__PEND_A_CleanShared:                                          { transient: true }
+  T_FILL_B__PEND_A_CleanUnique:                                          { transient: true }
+  T_FILL_B__PEND_A_MakeUnique:                                           { transient: true }
+  T_FILL_B__PEND_A_ReadClean:                                            { transient: true }
+  T_FILL_B__PEND_A_ReadNoSnp:                                            { transient: true }
+  T_FILL_B__PEND_A_ReadUnique:                                           { transient: true }
+  T_FILL_B__PEND_A_WriteBackFull:                                        { transient: true }
+  T_FILL_B__PEND_A_WriteCleanFull:                                       { transient: true }
+  T_FILL_B__PEND_A_WriteNoSnpFull:                                       { transient: true }
+  T_SNP_A__PEND_B_CleanInvalid:                                          { transient: true }
+  T_SNP_A__PEND_B_CleanShared:                                           { transient: true }
+  T_SNP_A__PEND_B_CleanUnique:                                           { transient: true }
+  T_SNP_A__PEND_B_MakeUnique:                                            { transient: true }
+  T_SNP_A__PEND_B_ReadClean:                                             { transient: true }
+  T_SNP_A__PEND_B_ReadNoSnp:                                             { transient: true }
+  T_SNP_A__PEND_B_ReadUnique:                                            { transient: true }
+  T_SNP_A__PEND_B_WriteBackFull:                                         { transient: true }
+  T_SNP_A__PEND_B_WriteCleanFull:                                        { transient: true }
+  T_SNP_A__PEND_B_WriteNoSnpFull:                                        { transient: true }
+  T_SNP_B__PEND_A_CleanInvalid:                                          { transient: true }
+  T_SNP_B__PEND_A_CleanShared:                                           { transient: true }
+  T_SNP_B__PEND_A_CleanUnique:                                           { transient: true }
+  T_SNP_B__PEND_A_MakeUnique:                                            { transient: true }
+  T_SNP_B__PEND_A_ReadClean:                                             { transient: true }
+  T_SNP_B__PEND_A_ReadNoSnp:                                             { transient: true }
+  T_SNP_B__PEND_A_ReadUnique:                                            { transient: true }
+  T_SNP_B__PEND_A_WriteBackFull:                                         { transient: true }
+  T_SNP_B__PEND_A_WriteCleanFull:                                        { transient: true }
+  T_SNP_B__PEND_A_WriteNoSnpFull:                                        { transient: true }
+  UC_A__PEND_B_CleanInvalid:                                             { transient: false }
+  UC_A__PEND_B_CleanShared:                                              { transient: false }
+  UC_A__PEND_B_CleanUnique:                                              { transient: false }
+  UC_A__PEND_B_MakeUnique:                                               { transient: false }
+  UC_A__PEND_B_ReadClean:                                                { transient: false }
+  UC_A__PEND_B_ReadNoSnp:                                                { transient: false }
+  UC_A__PEND_B_ReadUnique:                                               { transient: false }
+  UC_A__PEND_B_WriteBackFull:                                            { transient: false }
+  UC_A__PEND_B_WriteCleanFull:                                           { transient: false }
+  UC_A__PEND_B_WriteNoSnpFull:                                           { transient: false }
+  UC_B__PEND_A_CleanInvalid:                                             { transient: false }
+  UC_B__PEND_A_CleanShared:                                              { transient: false }
+  UC_B__PEND_A_CleanUnique:                                              { transient: false }
+  UC_B__PEND_A_MakeUnique:                                               { transient: false }
+  UC_B__PEND_A_ReadClean:                                                { transient: false }
+  UC_B__PEND_A_ReadNoSnp:                                                { transient: false }
+  UC_B__PEND_A_ReadUnique:                                               { transient: false }
+  UC_B__PEND_A_WriteBackFull:                                            { transient: false }
+  UC_B__PEND_A_WriteCleanFull:                                           { transient: false }
+  UC_B__PEND_A_WriteNoSnpFull:                                           { transient: false }
+
+
+edges:
+  # ----- from I -----
+  - { from: I,     event: REQ_A_ReadClean,       to: T_FILL_A, action: "SendReadNoSnpToSNF" }
+  - { from: I,     event: REQ_B_ReadClean,       to: T_FILL_B, action: "SendReadNoSnpToSNF" }
+  - { from: I,     event: REQ_A_ReadUnique,      to: T_FILL_A, action: "SendReadNoSnpToSNF" }
+  - { from: I,     event: REQ_B_ReadUnique,      to: T_FILL_B, action: "SendReadNoSnpToSNF" }
+  - { from: I,     event: REQ_A_MakeUnique,      to: T_ACK_A,  action: "SendComp(UC)" }
+  - { from: I,     event: REQ_B_MakeUnique,      to: T_ACK_B,  action: "SendComp(UC)" }
+
+  # ----- T_FILL_* -> stable on SNF return -----
+  # For simplicity, ReadClean lands the requester in SC_*, ReadUnique in UC_*.
+  # The driver picks which by remembering the issuing REQ; we encode both as
+  # available transitions and let the BFS keep both branches (the oracle
+  # disambiguates by stored intent).
+  - { from: T_FILL_A, event: SNF_DATA_AS_ReadClean,  to: T_ACK_A, action: "SendCompData(SC)" }
+  - { from: T_FILL_A, event: SNF_DATA_AS_ReadUnique, to: T_ACK_A, action: "SendCompData(UC)" }
+  - { from: T_FILL_B, event: SNF_DATA_AS_ReadClean,  to: T_ACK_B, action: "SendCompData(SC)" }
+  - { from: T_FILL_B, event: SNF_DATA_AS_ReadUnique, to: T_ACK_B, action: "SendCompData(UC)" }
+
+  # ----- T_ACK_* -> stable on CompAck -----
+  # Stable-state choice depends on intent recorded by driver; expose both.
+  - { from: T_ACK_A, event: COMPACK_A_ReadClean,  to: SC_A, action: "RetireMSHR" }
+  - { from: T_ACK_A, event: COMPACK_A_ReadUnique, to: UC_A, action: "RetireMSHR" }
+  - { from: T_ACK_A, event: COMPACK_A_MakeUnique, to: UC_A, action: "RetireMSHR" }
+  - { from: T_ACK_B, event: COMPACK_B_ReadClean,  to: SC_B, action: "RetireMSHR" }
+  - { from: T_ACK_B, event: COMPACK_B_ReadUnique, to: UC_B, action: "RetireMSHR" }
+  - { from: T_ACK_B, event: COMPACK_B_MakeUnique, to: UC_B, action: "RetireMSHR" }
+
+  # ----- from SC_A -----
+  - { from: SC_A,  event: REQ_A_Evict,            to: I,        action: "CompOnly" }
+  - { from: SC_A,  event: REQ_A_CleanUnique,      to: T_ACK_A,  action: "SendComp(UC,noSnp)" }
+  - { from: SC_A,  event: REQ_B_ReadClean,        to: T_SNP_B,  action: "SnpClean(A)" }
+  - { from: SC_A,  event: REQ_B_ReadUnique,       to: T_SNP_B,  action: "SnpUnique(A)" }
+  - { from: SC_A,  event: REQ_B_CleanUnique,      to: T_SNP_B,  action: "SnpMakeInvalid(A)" }
+  - { from: SC_A,  event: REQ_B_MakeUnique,       to: T_SNP_B,  action: "SnpMakeInvalid(A)" }
+  - { from: SC_A,  event: REQ_B_CleanInvalid,     to: T_SNP_B,  action: "SnpCleanInvalid(A)" }
+
+  # ----- from SC_B (mirror of SC_A) -----
+  - { from: SC_B,  event: REQ_B_Evict,            to: I,        action: "CompOnly" }
+  - { from: SC_B,  event: REQ_B_CleanUnique,      to: T_ACK_B,  action: "SendComp(UC,noSnp)" }
+  - { from: SC_B,  event: REQ_A_ReadClean,        to: T_SNP_A,  action: "SnpClean(B)" }
+  - { from: SC_B,  event: REQ_A_ReadUnique,       to: T_SNP_A,  action: "SnpUnique(B)" }
+  - { from: SC_B,  event: REQ_A_CleanUnique,      to: T_SNP_A,  action: "SnpMakeInvalid(B)" }
+  - { from: SC_B,  event: REQ_A_MakeUnique,       to: T_SNP_A,  action: "SnpMakeInvalid(B)" }
+  - { from: SC_B,  event: REQ_A_CleanInvalid,     to: T_SNP_A,  action: "SnpCleanInvalid(B)" }
+
+  # ----- T_SNP_* -> stable on SnpResp -----
+  # A is requester here, B is the snooped peer (and vice versa).
+  - { from: T_SNP_A, event: SNP_RESP_B_I_FOR_ReadClean,  to: T_ACK_A, action: "SendCompData(SC)" }
+  - { from: T_SNP_A, event: SNP_RESP_B_SC_FOR_ReadClean, to: T_ACK_A, action: "SendCompData(SC)" }
+  - { from: T_SNP_A, event: SNP_RESP_B_I_FOR_ReadUnique, to: T_ACK_A, action: "SendCompData(UC)" }
+  - { from: T_SNP_A, event: SNP_RESP_B_I_FOR_CleanUnique,to: T_ACK_A, action: "SendComp(UC)" }
+  - { from: T_SNP_A, event: SNP_RESP_B_I_FOR_MakeUnique, to: T_ACK_A, action: "SendComp(UCE)" }
+  - { from: T_SNP_A, event: SNP_RESP_B_I_FOR_CleanInval, to: T_ACK_A, action: "SendComp" }
+
+  - { from: T_SNP_B, event: SNP_RESP_A_I_FOR_ReadClean,  to: T_ACK_B, action: "SendCompData(SC)" }
+  - { from: T_SNP_B, event: SNP_RESP_A_SC_FOR_ReadClean, to: T_ACK_B, action: "SendCompData(SC)" }
+  - { from: T_SNP_B, event: SNP_RESP_A_I_FOR_ReadUnique, to: T_ACK_B, action: "SendCompData(UC)" }
+  - { from: T_SNP_B, event: SNP_RESP_A_I_FOR_CleanUnique,to: T_ACK_B, action: "SendComp(UC)" }
+  - { from: T_SNP_B, event: SNP_RESP_A_I_FOR_MakeUnique, to: T_ACK_B, action: "SendComp(UCE)" }
+  - { from: T_SNP_B, event: SNP_RESP_A_I_FOR_CleanInval, to: T_ACK_B, action: "SendComp" }
+
+  # CompAck post-snoop variants (resolve T_ACK from snoop-induced fills)
+  - { from: T_ACK_A, event: COMPACK_A_CleanUnique, to: UC_A, action: "RetireMSHR" }
+  - { from: T_ACK_A, event: COMPACK_A_CleanInval,  to: I,    action: "RetireMSHR" }
+  - { from: T_ACK_B, event: COMPACK_B_CleanUnique, to: UC_B, action: "RetireMSHR" }
+  - { from: T_ACK_B, event: COMPACK_B_CleanInval,  to: I,    action: "RetireMSHR" }
+
+  # ----- from UC_A -----
+  - { from: UC_A,  event: REQ_A_WriteBackFull,    to: I,       action: "SendDBIDResp" } # simplified: WB clears line
+  - { from: UC_A,  event: REQ_A_Evict,            to: I,       action: "CompOnly" }
+  - { from: UC_A,  event: REQ_B_ReadClean,        to: T_SNP_B, action: "SnpClean(A)" }
+  - { from: UC_A,  event: REQ_B_ReadUnique,       to: T_SNP_B, action: "SnpUnique(A)" }
+
+  # ----- from UC_B -----
+  - { from: UC_B,  event: REQ_B_WriteBackFull,    to: I,       action: "SendDBIDResp" }
+  - { from: UC_B,  event: REQ_B_Evict,            to: I,       action: "CompOnly" }
+  - { from: UC_B,  event: REQ_A_ReadClean,        to: T_SNP_A, action: "SnpClean(B)" }
+  - { from: UC_B,  event: REQ_A_ReadUnique,       to: T_SNP_A, action: "SnpUnique(B)" }
+
+  # ----- snoop from UC_*: SnpClean can return SC (downgrade) or I -----
+  # These edges allow BFS to reach SC_AB via the UC_*-SnpClean path.
+  - { from: T_SNP_B, event: SNP_RESP_A_SC_FOR_ReadClean_FROM_UC, to: SC_AB, action: "SendCompData(SC),AendsSC" }
+  - { from: T_SNP_A, event: SNP_RESP_B_SC_FOR_ReadClean_FROM_UC, to: SC_AB, action: "SendCompData(SC),BendsSC" }
+
+  # ----- from SC_AB -----
+  - { from: SC_AB, event: REQ_A_Evict,            to: SC_B,    action: "CompOnly" }
+  - { from: SC_AB, event: REQ_B_Evict,            to: SC_A,    action: "CompOnly" }
+  - { from: SC_AB, event: REQ_A_CleanUnique,      to: T_SNP_A, action: "SnpMakeInvalid(B)" }
+  - { from: SC_AB, event: REQ_B_CleanUnique,      to: T_SNP_B, action: "SnpMakeInvalid(A)" }
+
+  # ----- from UD_* (UD reached via writes — modeled as: WriteUniqueFull lands UC, dirty-promote via internal store) -----
+  # Kept minimal here; BFS coverage for UD requires extending the model.
+  - { from: UC_A,  event: INT_StoreHit_A,         to: UD_A,    action: "MarkDirty" }
+  - { from: UC_B,  event: INT_StoreHit_B,         to: UD_B,    action: "MarkDirty" }
+  - { from: UD_A,  event: REQ_A_WriteBackFull,    to: I,       action: "AcceptCBData" }
+  - { from: UD_B,  event: REQ_B_WriteBackFull,    to: I,       action: "AcceptCBData" }
+  - { from: UD_A,  event: REQ_B_ReadUnique,       to: T_SNP_B, action: "SnpUnique(A,DataXfer)" }
+  - { from: UD_B,  event: REQ_A_ReadUnique,       to: T_SNP_A, action: "SnpUnique(B,DataXfer)" }
+
+  # ── BYPASS-class write-back REQs (no MSHR alloc; just retire line) ──────
+  # hnf_mshr_bypass.v classifies WriteBackFull/WriteEvictFull/WriteCleanFull
+  # as req_cb_s0 — HNF returns DBIDResp+Comp via the bypass path, then
+  # accepts CBData. No snoop traffic, no main-MSHR allocation.
+  - { from: UC_B,  event: REQ_B_WriteBackFull,    to: I,       action: "SendDBIDResp (BYPASS)" }
+  - { from: UD_A,  event: REQ_A_WriteEvictFull,   to: I,       action: "SendDBIDResp (BYPASS)" }
+  - { from: UD_B,  event: REQ_B_WriteEvictFull,   to: I,       action: "SendDBIDResp (BYPASS)" }
+  - { from: UC_A,  event: REQ_A_WriteCleanFull,   to: UC_A,    action: "SendDBIDResp (BYPASS,DataPersistsClean)" }
+  - { from: UC_B,  event: REQ_B_WriteCleanFull,   to: UC_B,    action: "SendDBIDResp (BYPASS,DataPersistsClean)" }
+  - { from: UD_A,  event: REQ_A_WriteCleanFull,   to: UC_A,    action: "SendDBIDResp (BYPASS,DirtyFlushedClean)" }
+  - { from: UD_B,  event: REQ_B_WriteCleanFull,   to: UC_B,    action: "SendDBIDResp (BYPASS,DirtyFlushedClean)" }
+
+  # ── CleanShared (hint to flush dirty copies, keep readable) ─────────────
+  # HNF emits SnpCleanShared (hnf_mshr_ctl.v:1977-1978). RN-F downgrades
+  # UD→SC (or UC→SC) and may return data; no state change for clean lines.
+  - { from: I,     event: REQ_A_CleanShared,      to: T_ACK_A, action: "SendComp(noSnp)" }
+  - { from: I,     event: REQ_B_CleanShared,      to: T_ACK_B, action: "SendComp(noSnp)" }
+  - { from: SC_A,  event: REQ_A_CleanShared,      to: T_ACK_A, action: "SendComp(noSnp)" }
+  - { from: SC_B,  event: REQ_B_CleanShared,      to: T_ACK_B, action: "SendComp(noSnp)" }
+  - { from: SC_A,  event: REQ_B_CleanShared,      to: T_SNP_B, action: "SnpCleanShared(A)" }
+  - { from: SC_B,  event: REQ_A_CleanShared,      to: T_SNP_A, action: "SnpCleanShared(B)" }
+  - { from: UC_A,  event: REQ_B_CleanShared,      to: T_SNP_B, action: "SnpCleanShared(A)" }
+  - { from: UC_B,  event: REQ_A_CleanShared,      to: T_SNP_A, action: "SnpCleanShared(B)" }
+  - { from: UD_A,  event: REQ_B_CleanShared,      to: T_SNP_B, action: "SnpCleanShared(A,DataXfer)" }
+  - { from: UD_B,  event: REQ_A_CleanShared,      to: T_SNP_A, action: "SnpCleanShared(B,DataXfer)" }
+  - { from: T_SNP_A, event: SNP_RESP_B_SC_FOR_CleanShared, to: T_ACK_A, action: "SendComp" }
+  - { from: T_SNP_B, event: SNP_RESP_A_SC_FOR_CleanShared, to: T_ACK_B, action: "SendComp" }
+  - { from: T_ACK_A, event: COMPACK_A_CleanShared, to: I,    action: "RetireMSHR" }
+  - { from: T_ACK_B, event: COMPACK_B_CleanShared, to: I,    action: "RetireMSHR" }
+
+  # ── ReadOnce (BYPASS-class non-allocating read) ─────────────────────────
+  # hnf_mshr_bypass.v:186 classifies ReadOnce as req_rd_s0 — bypass path,
+  # no main-MSHR allocation. Snoop is emitted (SnpOnce) only if peer holds
+  # the line; otherwise straight to SNF.
+  - { from: I,     event: REQ_A_ReadOnce,         to: I,       action: "SendCompData fromSNF (BYPASS)" }
+  - { from: I,     event: REQ_B_ReadOnce,         to: I,       action: "SendCompData fromSNF (BYPASS)" }
+  - { from: SC_A,  event: REQ_B_ReadOnce,         to: SC_A,    action: "SnpOnce(A)+CompData (BYPASS)" }
+  - { from: SC_B,  event: REQ_A_ReadOnce,         to: SC_B,    action: "SnpOnce(B)+CompData (BYPASS)" }
+  - { from: UC_A,  event: REQ_B_ReadOnce,         to: UC_A,    action: "SnpOnce(A)+CompData (BYPASS)" }
+  - { from: UC_B,  event: REQ_A_ReadOnce,         to: UC_B,    action: "SnpOnce(B)+CompData (BYPASS)" }
+  - { from: UD_A,  event: REQ_B_ReadOnce,         to: UD_A,    action: "SnpOnce(A)+CompData (BYPASS)" }
+  - { from: UD_B,  event: REQ_A_ReadOnce,         to: UD_B,    action: "SnpOnce(B)+CompData (BYPASS)" }
+
+  # ── ReadNoSnp (BYPASS, DMT to SNF) ──────────────────────────────────────
+  # hnf_mshr_bypass.v:190; do_dmt_s0 path in hnf_mshr_ctl.v:364. HNF sets
+  # ReturnNID/ReturnTxnID and SNF replies CompData directly to the RN-F.
+  # No snoops, no MSHR. Line state at HNF (SF/L3) is unchanged.
+  - { from: I,     event: REQ_A_ReadNoSnp,        to: I,       action: "DMT(SNF→A) (BYPASS)" }
+  - { from: I,     event: REQ_B_ReadNoSnp,        to: I,       action: "DMT(SNF→B) (BYPASS)" }
+  - { from: SC_A,  event: REQ_A_ReadNoSnp,        to: SC_A,    action: "DMT(SNF→A) (BYPASS)" }
+  - { from: SC_B,  event: REQ_B_ReadNoSnp,        to: SC_B,    action: "DMT(SNF→B) (BYPASS)" }
+  - { from: UC_A,  event: REQ_A_ReadNoSnp,        to: UC_A,    action: "DMT(SNF→A) (BYPASS)" }
+  - { from: UC_B,  event: REQ_B_ReadNoSnp,        to: UC_B,    action: "DMT(SNF→B) (BYPASS)" }
+
+  # ── WriteNoSnp{Full,Ptl} (BYPASS, non-coherent write) ──────────────────
+  # hnf_mshr_bypass.v:193; HNF returns DBIDResp+Comp via bypass, accepts
+  # data, forwards to SNF. No snoops, no MSHR. Doesn't change line state
+  # at HNF directory (writes go around the cache hierarchy).
+  - { from: I,     event: REQ_A_WriteNoSnpFull,   to: I,       action: "DBIDResp+Comp (BYPASS)" }
+  - { from: I,     event: REQ_B_WriteNoSnpFull,   to: I,       action: "DBIDResp+Comp (BYPASS)" }
+
+  # ════════════════════════════════════════════════════════════════════════
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Auto-generated pending-state edges (expand_hazards.py)
+  # 140 new states + 412 new edges encoding the
+  # CAM-hazard pending-REQ machinery. Each composite state
+  # `<state>__PEND_<peer>_<op>` carries (in-flight transient, queued peer
+  # REQ). Re-run `expand_hazards.py` after editing the base FSM above
+  # to regenerate these.
+  # ════════════════════════════════════════════════════════════════════════
+  - { from: T_FILL_A,                                          event: REQ_B_ReadClean__HAZARD,                                       to: T_FILL_A__PEND_B_ReadClean,                        action: "queue B_ReadClean; transient continues" }
+  - { from: T_FILL_A__PEND_B_ReadClean,                        event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_A__PEND_B_ReadClean,                         action: "SendCompData(SC) (with B_ReadClean queued)" }
+  - { from: T_FILL_A__PEND_B_ReadClean,                        event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_A__PEND_B_ReadClean,                         action: "SendCompData(UC) (with B_ReadClean queued)" }
+  - { from: T_FILL_A,                                          event: REQ_B_ReadUnique__HAZARD,                                      to: T_FILL_A__PEND_B_ReadUnique,                       action: "queue B_ReadUnique; transient continues" }
+  - { from: T_FILL_A__PEND_B_ReadUnique,                       event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_A__PEND_B_ReadUnique,                        action: "SendCompData(SC) (with B_ReadUnique queued)" }
+  - { from: T_FILL_A__PEND_B_ReadUnique,                       event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_A__PEND_B_ReadUnique,                        action: "SendCompData(UC) (with B_ReadUnique queued)" }
+  - { from: T_FILL_A,                                          event: REQ_B_MakeUnique__HAZARD,                                      to: T_FILL_A__PEND_B_MakeUnique,                       action: "queue B_MakeUnique; transient continues" }
+  - { from: T_FILL_A__PEND_B_MakeUnique,                       event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_A__PEND_B_MakeUnique,                        action: "SendCompData(SC) (with B_MakeUnique queued)" }
+  - { from: T_FILL_A__PEND_B_MakeUnique,                       event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_A__PEND_B_MakeUnique,                        action: "SendCompData(UC) (with B_MakeUnique queued)" }
+  - { from: T_FILL_A,                                          event: REQ_B_CleanShared__HAZARD,                                     to: T_FILL_A__PEND_B_CleanShared,                      action: "queue B_CleanShared; transient continues" }
+  - { from: T_FILL_A__PEND_B_CleanShared,                      event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_A__PEND_B_CleanShared,                       action: "SendCompData(SC) (with B_CleanShared queued)" }
+  - { from: T_FILL_A__PEND_B_CleanShared,                      event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_A__PEND_B_CleanShared,                       action: "SendCompData(UC) (with B_CleanShared queued)" }
+  - { from: T_FILL_A,                                          event: REQ_B_CleanUnique__HAZARD,                                     to: T_FILL_A__PEND_B_CleanUnique,                      action: "queue B_CleanUnique; transient continues" }
+  - { from: T_FILL_A__PEND_B_CleanUnique,                      event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_A__PEND_B_CleanUnique,                       action: "SendCompData(SC) (with B_CleanUnique queued)" }
+  - { from: T_FILL_A__PEND_B_CleanUnique,                      event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_A__PEND_B_CleanUnique,                       action: "SendCompData(UC) (with B_CleanUnique queued)" }
+  - { from: T_FILL_A,                                          event: REQ_B_CleanInvalid__HAZARD,                                    to: T_FILL_A__PEND_B_CleanInvalid,                     action: "queue B_CleanInvalid; transient continues" }
+  - { from: T_FILL_A__PEND_B_CleanInvalid,                     event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_A__PEND_B_CleanInvalid,                      action: "SendCompData(SC) (with B_CleanInvalid queued)" }
+  - { from: T_FILL_A__PEND_B_CleanInvalid,                     event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_A__PEND_B_CleanInvalid,                      action: "SendCompData(UC) (with B_CleanInvalid queued)" }
+  - { from: T_FILL_A,                                          event: REQ_B_ReadNoSnp__HAZARD,                                       to: T_FILL_A__PEND_B_ReadNoSnp,                        action: "queue B_ReadNoSnp; transient continues" }
+  - { from: T_FILL_A__PEND_B_ReadNoSnp,                        event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_A__PEND_B_ReadNoSnp,                         action: "SendCompData(SC) (with B_ReadNoSnp queued)" }
+  - { from: T_FILL_A__PEND_B_ReadNoSnp,                        event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_A__PEND_B_ReadNoSnp,                         action: "SendCompData(UC) (with B_ReadNoSnp queued)" }
+  - { from: T_FILL_A,                                          event: REQ_B_WriteNoSnpFull__HAZARD,                                  to: T_FILL_A__PEND_B_WriteNoSnpFull,                   action: "queue B_WriteNoSnpFull; transient continues" }
+  - { from: T_FILL_A__PEND_B_WriteNoSnpFull,                   event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_A__PEND_B_WriteNoSnpFull,                    action: "SendCompData(SC) (with B_WriteNoSnpFull queued)" }
+  - { from: T_FILL_A__PEND_B_WriteNoSnpFull,                   event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_A__PEND_B_WriteNoSnpFull,                    action: "SendCompData(UC) (with B_WriteNoSnpFull queued)" }
+  - { from: T_FILL_A,                                          event: REQ_B_WriteBackFull__HAZARD,                                   to: T_FILL_A__PEND_B_WriteBackFull,                    action: "queue B_WriteBackFull; transient continues" }
+  - { from: T_FILL_A__PEND_B_WriteBackFull,                    event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_A__PEND_B_WriteBackFull,                     action: "SendCompData(SC) (with B_WriteBackFull queued)" }
+  - { from: T_FILL_A__PEND_B_WriteBackFull,                    event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_A__PEND_B_WriteBackFull,                     action: "SendCompData(UC) (with B_WriteBackFull queued)" }
+  - { from: T_FILL_A,                                          event: REQ_B_WriteCleanFull__HAZARD,                                  to: T_FILL_A__PEND_B_WriteCleanFull,                   action: "queue B_WriteCleanFull; transient continues" }
+  - { from: T_FILL_A__PEND_B_WriteCleanFull,                   event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_A__PEND_B_WriteCleanFull,                    action: "SendCompData(SC) (with B_WriteCleanFull queued)" }
+  - { from: T_FILL_A__PEND_B_WriteCleanFull,                   event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_A__PEND_B_WriteCleanFull,                    action: "SendCompData(UC) (with B_WriteCleanFull queued)" }
+  - { from: T_FILL_B,                                          event: REQ_A_ReadClean__HAZARD,                                       to: T_FILL_B__PEND_A_ReadClean,                        action: "queue A_ReadClean; transient continues" }
+  - { from: T_FILL_B__PEND_A_ReadClean,                        event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_B__PEND_A_ReadClean,                         action: "SendCompData(SC) (with A_ReadClean queued)" }
+  - { from: T_FILL_B__PEND_A_ReadClean,                        event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_B__PEND_A_ReadClean,                         action: "SendCompData(UC) (with A_ReadClean queued)" }
+  - { from: T_FILL_B,                                          event: REQ_A_ReadUnique__HAZARD,                                      to: T_FILL_B__PEND_A_ReadUnique,                       action: "queue A_ReadUnique; transient continues" }
+  - { from: T_FILL_B__PEND_A_ReadUnique,                       event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_B__PEND_A_ReadUnique,                        action: "SendCompData(SC) (with A_ReadUnique queued)" }
+  - { from: T_FILL_B__PEND_A_ReadUnique,                       event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_B__PEND_A_ReadUnique,                        action: "SendCompData(UC) (with A_ReadUnique queued)" }
+  - { from: T_FILL_B,                                          event: REQ_A_MakeUnique__HAZARD,                                      to: T_FILL_B__PEND_A_MakeUnique,                       action: "queue A_MakeUnique; transient continues" }
+  - { from: T_FILL_B__PEND_A_MakeUnique,                       event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_B__PEND_A_MakeUnique,                        action: "SendCompData(SC) (with A_MakeUnique queued)" }
+  - { from: T_FILL_B__PEND_A_MakeUnique,                       event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_B__PEND_A_MakeUnique,                        action: "SendCompData(UC) (with A_MakeUnique queued)" }
+  - { from: T_FILL_B,                                          event: REQ_A_CleanShared__HAZARD,                                     to: T_FILL_B__PEND_A_CleanShared,                      action: "queue A_CleanShared; transient continues" }
+  - { from: T_FILL_B__PEND_A_CleanShared,                      event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_B__PEND_A_CleanShared,                       action: "SendCompData(SC) (with A_CleanShared queued)" }
+  - { from: T_FILL_B__PEND_A_CleanShared,                      event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_B__PEND_A_CleanShared,                       action: "SendCompData(UC) (with A_CleanShared queued)" }
+  - { from: T_FILL_B,                                          event: REQ_A_CleanUnique__HAZARD,                                     to: T_FILL_B__PEND_A_CleanUnique,                      action: "queue A_CleanUnique; transient continues" }
+  - { from: T_FILL_B__PEND_A_CleanUnique,                      event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_B__PEND_A_CleanUnique,                       action: "SendCompData(SC) (with A_CleanUnique queued)" }
+  - { from: T_FILL_B__PEND_A_CleanUnique,                      event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_B__PEND_A_CleanUnique,                       action: "SendCompData(UC) (with A_CleanUnique queued)" }
+  - { from: T_FILL_B,                                          event: REQ_A_CleanInvalid__HAZARD,                                    to: T_FILL_B__PEND_A_CleanInvalid,                     action: "queue A_CleanInvalid; transient continues" }
+  - { from: T_FILL_B__PEND_A_CleanInvalid,                     event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_B__PEND_A_CleanInvalid,                      action: "SendCompData(SC) (with A_CleanInvalid queued)" }
+  - { from: T_FILL_B__PEND_A_CleanInvalid,                     event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_B__PEND_A_CleanInvalid,                      action: "SendCompData(UC) (with A_CleanInvalid queued)" }
+  - { from: T_FILL_B,                                          event: REQ_A_ReadNoSnp__HAZARD,                                       to: T_FILL_B__PEND_A_ReadNoSnp,                        action: "queue A_ReadNoSnp; transient continues" }
+  - { from: T_FILL_B__PEND_A_ReadNoSnp,                        event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_B__PEND_A_ReadNoSnp,                         action: "SendCompData(SC) (with A_ReadNoSnp queued)" }
+  - { from: T_FILL_B__PEND_A_ReadNoSnp,                        event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_B__PEND_A_ReadNoSnp,                         action: "SendCompData(UC) (with A_ReadNoSnp queued)" }
+  - { from: T_FILL_B,                                          event: REQ_A_WriteNoSnpFull__HAZARD,                                  to: T_FILL_B__PEND_A_WriteNoSnpFull,                   action: "queue A_WriteNoSnpFull; transient continues" }
+  - { from: T_FILL_B__PEND_A_WriteNoSnpFull,                   event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_B__PEND_A_WriteNoSnpFull,                    action: "SendCompData(SC) (with A_WriteNoSnpFull queued)" }
+  - { from: T_FILL_B__PEND_A_WriteNoSnpFull,                   event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_B__PEND_A_WriteNoSnpFull,                    action: "SendCompData(UC) (with A_WriteNoSnpFull queued)" }
+  - { from: T_FILL_B,                                          event: REQ_A_WriteBackFull__HAZARD,                                   to: T_FILL_B__PEND_A_WriteBackFull,                    action: "queue A_WriteBackFull; transient continues" }
+  - { from: T_FILL_B__PEND_A_WriteBackFull,                    event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_B__PEND_A_WriteBackFull,                     action: "SendCompData(SC) (with A_WriteBackFull queued)" }
+  - { from: T_FILL_B__PEND_A_WriteBackFull,                    event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_B__PEND_A_WriteBackFull,                     action: "SendCompData(UC) (with A_WriteBackFull queued)" }
+  - { from: T_FILL_B,                                          event: REQ_A_WriteCleanFull__HAZARD,                                  to: T_FILL_B__PEND_A_WriteCleanFull,                   action: "queue A_WriteCleanFull; transient continues" }
+  - { from: T_FILL_B__PEND_A_WriteCleanFull,                   event: SNF_DATA_AS_ReadClean,                                         to: T_ACK_B__PEND_A_WriteCleanFull,                    action: "SendCompData(SC) (with A_WriteCleanFull queued)" }
+  - { from: T_FILL_B__PEND_A_WriteCleanFull,                   event: SNF_DATA_AS_ReadUnique,                                        to: T_ACK_B__PEND_A_WriteCleanFull,                    action: "SendCompData(UC) (with A_WriteCleanFull queued)" }
+  - { from: T_SNP_A,                                           event: REQ_B_ReadClean__HAZARD,                                       to: T_SNP_A__PEND_B_ReadClean,                         action: "queue B_ReadClean; transient continues" }
+  - { from: T_SNP_A__PEND_B_ReadClean,                         event: SNP_RESP_B_I_FOR_ReadClean,                                    to: T_ACK_A__PEND_B_ReadClean,                         action: "SendCompData(SC) (with B_ReadClean queued)" }
+  - { from: T_SNP_A__PEND_B_ReadClean,                         event: SNP_RESP_B_SC_FOR_ReadClean,                                   to: T_ACK_A__PEND_B_ReadClean,                         action: "SendCompData(SC) (with B_ReadClean queued)" }
+  - { from: T_SNP_A__PEND_B_ReadClean,                         event: SNP_RESP_B_I_FOR_ReadUnique,                                   to: T_ACK_A__PEND_B_ReadClean,                         action: "SendCompData(UC) (with B_ReadClean queued)" }
+  - { from: T_SNP_A__PEND_B_ReadClean,                         event: SNP_RESP_B_I_FOR_CleanUnique,                                  to: T_ACK_A__PEND_B_ReadClean,                         action: "SendComp(UC) (with B_ReadClean queued)" }
+  - { from: T_SNP_A__PEND_B_ReadClean,                         event: SNP_RESP_B_I_FOR_MakeUnique,                                   to: T_ACK_A__PEND_B_ReadClean,                         action: "SendComp(UCE) (with B_ReadClean queued)" }
+  - { from: T_SNP_A__PEND_B_ReadClean,                         event: SNP_RESP_B_I_FOR_CleanInval,                                   to: T_ACK_A__PEND_B_ReadClean,                         action: "SendComp (with B_ReadClean queued)" }
+  - { from: T_SNP_A__PEND_B_ReadClean,                         event: SNP_RESP_B_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_B_ReadClean,                           action: "SendCompData(SC),BendsSC (with B_ReadClean queued)" }
+  - { from: T_SNP_A__PEND_B_ReadClean,                         event: SNP_RESP_B_SC_FOR_CleanShared,                                 to: T_ACK_A__PEND_B_ReadClean,                         action: "SendComp (with B_ReadClean queued)" }
+  - { from: T_SNP_A,                                           event: REQ_B_ReadUnique__HAZARD,                                      to: T_SNP_A__PEND_B_ReadUnique,                        action: "queue B_ReadUnique; transient continues" }
+  - { from: T_SNP_A__PEND_B_ReadUnique,                        event: SNP_RESP_B_I_FOR_ReadClean,                                    to: T_ACK_A__PEND_B_ReadUnique,                        action: "SendCompData(SC) (with B_ReadUnique queued)" }
+  - { from: T_SNP_A__PEND_B_ReadUnique,                        event: SNP_RESP_B_SC_FOR_ReadClean,                                   to: T_ACK_A__PEND_B_ReadUnique,                        action: "SendCompData(SC) (with B_ReadUnique queued)" }
+  - { from: T_SNP_A__PEND_B_ReadUnique,                        event: SNP_RESP_B_I_FOR_ReadUnique,                                   to: T_ACK_A__PEND_B_ReadUnique,                        action: "SendCompData(UC) (with B_ReadUnique queued)" }
+  - { from: T_SNP_A__PEND_B_ReadUnique,                        event: SNP_RESP_B_I_FOR_CleanUnique,                                  to: T_ACK_A__PEND_B_ReadUnique,                        action: "SendComp(UC) (with B_ReadUnique queued)" }
+  - { from: T_SNP_A__PEND_B_ReadUnique,                        event: SNP_RESP_B_I_FOR_MakeUnique,                                   to: T_ACK_A__PEND_B_ReadUnique,                        action: "SendComp(UCE) (with B_ReadUnique queued)" }
+  - { from: T_SNP_A__PEND_B_ReadUnique,                        event: SNP_RESP_B_I_FOR_CleanInval,                                   to: T_ACK_A__PEND_B_ReadUnique,                        action: "SendComp (with B_ReadUnique queued)" }
+  - { from: T_SNP_A__PEND_B_ReadUnique,                        event: SNP_RESP_B_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_B_ReadUnique,                          action: "SendCompData(SC),BendsSC (with B_ReadUnique queued)" }
+  - { from: T_SNP_A__PEND_B_ReadUnique,                        event: SNP_RESP_B_SC_FOR_CleanShared,                                 to: T_ACK_A__PEND_B_ReadUnique,                        action: "SendComp (with B_ReadUnique queued)" }
+  - { from: T_SNP_A,                                           event: REQ_B_MakeUnique__HAZARD,                                      to: T_SNP_A__PEND_B_MakeUnique,                        action: "queue B_MakeUnique; transient continues" }
+  - { from: T_SNP_A__PEND_B_MakeUnique,                        event: SNP_RESP_B_I_FOR_ReadClean,                                    to: T_ACK_A__PEND_B_MakeUnique,                        action: "SendCompData(SC) (with B_MakeUnique queued)" }
+  - { from: T_SNP_A__PEND_B_MakeUnique,                        event: SNP_RESP_B_SC_FOR_ReadClean,                                   to: T_ACK_A__PEND_B_MakeUnique,                        action: "SendCompData(SC) (with B_MakeUnique queued)" }
+  - { from: T_SNP_A__PEND_B_MakeUnique,                        event: SNP_RESP_B_I_FOR_ReadUnique,                                   to: T_ACK_A__PEND_B_MakeUnique,                        action: "SendCompData(UC) (with B_MakeUnique queued)" }
+  - { from: T_SNP_A__PEND_B_MakeUnique,                        event: SNP_RESP_B_I_FOR_CleanUnique,                                  to: T_ACK_A__PEND_B_MakeUnique,                        action: "SendComp(UC) (with B_MakeUnique queued)" }
+  - { from: T_SNP_A__PEND_B_MakeUnique,                        event: SNP_RESP_B_I_FOR_MakeUnique,                                   to: T_ACK_A__PEND_B_MakeUnique,                        action: "SendComp(UCE) (with B_MakeUnique queued)" }
+  - { from: T_SNP_A__PEND_B_MakeUnique,                        event: SNP_RESP_B_I_FOR_CleanInval,                                   to: T_ACK_A__PEND_B_MakeUnique,                        action: "SendComp (with B_MakeUnique queued)" }
+  - { from: T_SNP_A__PEND_B_MakeUnique,                        event: SNP_RESP_B_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_B_MakeUnique,                          action: "SendCompData(SC),BendsSC (with B_MakeUnique queued)" }
+  - { from: T_SNP_A__PEND_B_MakeUnique,                        event: SNP_RESP_B_SC_FOR_CleanShared,                                 to: T_ACK_A__PEND_B_MakeUnique,                        action: "SendComp (with B_MakeUnique queued)" }
+  - { from: T_SNP_A,                                           event: REQ_B_CleanShared__HAZARD,                                     to: T_SNP_A__PEND_B_CleanShared,                       action: "queue B_CleanShared; transient continues" }
+  - { from: T_SNP_A__PEND_B_CleanShared,                       event: SNP_RESP_B_I_FOR_ReadClean,                                    to: T_ACK_A__PEND_B_CleanShared,                       action: "SendCompData(SC) (with B_CleanShared queued)" }
+  - { from: T_SNP_A__PEND_B_CleanShared,                       event: SNP_RESP_B_SC_FOR_ReadClean,                                   to: T_ACK_A__PEND_B_CleanShared,                       action: "SendCompData(SC) (with B_CleanShared queued)" }
+  - { from: T_SNP_A__PEND_B_CleanShared,                       event: SNP_RESP_B_I_FOR_ReadUnique,                                   to: T_ACK_A__PEND_B_CleanShared,                       action: "SendCompData(UC) (with B_CleanShared queued)" }
+  - { from: T_SNP_A__PEND_B_CleanShared,                       event: SNP_RESP_B_I_FOR_CleanUnique,                                  to: T_ACK_A__PEND_B_CleanShared,                       action: "SendComp(UC) (with B_CleanShared queued)" }
+  - { from: T_SNP_A__PEND_B_CleanShared,                       event: SNP_RESP_B_I_FOR_MakeUnique,                                   to: T_ACK_A__PEND_B_CleanShared,                       action: "SendComp(UCE) (with B_CleanShared queued)" }
+  - { from: T_SNP_A__PEND_B_CleanShared,                       event: SNP_RESP_B_I_FOR_CleanInval,                                   to: T_ACK_A__PEND_B_CleanShared,                       action: "SendComp (with B_CleanShared queued)" }
+  - { from: T_SNP_A__PEND_B_CleanShared,                       event: SNP_RESP_B_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_B_CleanShared,                         action: "SendCompData(SC),BendsSC (with B_CleanShared queued)" }
+  - { from: T_SNP_A__PEND_B_CleanShared,                       event: SNP_RESP_B_SC_FOR_CleanShared,                                 to: T_ACK_A__PEND_B_CleanShared,                       action: "SendComp (with B_CleanShared queued)" }
+  - { from: T_SNP_A,                                           event: REQ_B_CleanUnique__HAZARD,                                     to: T_SNP_A__PEND_B_CleanUnique,                       action: "queue B_CleanUnique; transient continues" }
+  - { from: T_SNP_A__PEND_B_CleanUnique,                       event: SNP_RESP_B_I_FOR_ReadClean,                                    to: T_ACK_A__PEND_B_CleanUnique,                       action: "SendCompData(SC) (with B_CleanUnique queued)" }
+  - { from: T_SNP_A__PEND_B_CleanUnique,                       event: SNP_RESP_B_SC_FOR_ReadClean,                                   to: T_ACK_A__PEND_B_CleanUnique,                       action: "SendCompData(SC) (with B_CleanUnique queued)" }
+  - { from: T_SNP_A__PEND_B_CleanUnique,                       event: SNP_RESP_B_I_FOR_ReadUnique,                                   to: T_ACK_A__PEND_B_CleanUnique,                       action: "SendCompData(UC) (with B_CleanUnique queued)" }
+  - { from: T_SNP_A__PEND_B_CleanUnique,                       event: SNP_RESP_B_I_FOR_CleanUnique,                                  to: T_ACK_A__PEND_B_CleanUnique,                       action: "SendComp(UC) (with B_CleanUnique queued)" }
+  - { from: T_SNP_A__PEND_B_CleanUnique,                       event: SNP_RESP_B_I_FOR_MakeUnique,                                   to: T_ACK_A__PEND_B_CleanUnique,                       action: "SendComp(UCE) (with B_CleanUnique queued)" }
+  - { from: T_SNP_A__PEND_B_CleanUnique,                       event: SNP_RESP_B_I_FOR_CleanInval,                                   to: T_ACK_A__PEND_B_CleanUnique,                       action: "SendComp (with B_CleanUnique queued)" }
+  - { from: T_SNP_A__PEND_B_CleanUnique,                       event: SNP_RESP_B_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_B_CleanUnique,                         action: "SendCompData(SC),BendsSC (with B_CleanUnique queued)" }
+  - { from: T_SNP_A__PEND_B_CleanUnique,                       event: SNP_RESP_B_SC_FOR_CleanShared,                                 to: T_ACK_A__PEND_B_CleanUnique,                       action: "SendComp (with B_CleanUnique queued)" }
+  - { from: T_SNP_A,                                           event: REQ_B_CleanInvalid__HAZARD,                                    to: T_SNP_A__PEND_B_CleanInvalid,                      action: "queue B_CleanInvalid; transient continues" }
+  - { from: T_SNP_A__PEND_B_CleanInvalid,                      event: SNP_RESP_B_I_FOR_ReadClean,                                    to: T_ACK_A__PEND_B_CleanInvalid,                      action: "SendCompData(SC) (with B_CleanInvalid queued)" }
+  - { from: T_SNP_A__PEND_B_CleanInvalid,                      event: SNP_RESP_B_SC_FOR_ReadClean,                                   to: T_ACK_A__PEND_B_CleanInvalid,                      action: "SendCompData(SC) (with B_CleanInvalid queued)" }
+  - { from: T_SNP_A__PEND_B_CleanInvalid,                      event: SNP_RESP_B_I_FOR_ReadUnique,                                   to: T_ACK_A__PEND_B_CleanInvalid,                      action: "SendCompData(UC) (with B_CleanInvalid queued)" }
+  - { from: T_SNP_A__PEND_B_CleanInvalid,                      event: SNP_RESP_B_I_FOR_CleanUnique,                                  to: T_ACK_A__PEND_B_CleanInvalid,                      action: "SendComp(UC) (with B_CleanInvalid queued)" }
+  - { from: T_SNP_A__PEND_B_CleanInvalid,                      event: SNP_RESP_B_I_FOR_MakeUnique,                                   to: T_ACK_A__PEND_B_CleanInvalid,                      action: "SendComp(UCE) (with B_CleanInvalid queued)" }
+  - { from: T_SNP_A__PEND_B_CleanInvalid,                      event: SNP_RESP_B_I_FOR_CleanInval,                                   to: T_ACK_A__PEND_B_CleanInvalid,                      action: "SendComp (with B_CleanInvalid queued)" }
+  - { from: T_SNP_A__PEND_B_CleanInvalid,                      event: SNP_RESP_B_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_B_CleanInvalid,                        action: "SendCompData(SC),BendsSC (with B_CleanInvalid queued)" }
+  - { from: T_SNP_A__PEND_B_CleanInvalid,                      event: SNP_RESP_B_SC_FOR_CleanShared,                                 to: T_ACK_A__PEND_B_CleanInvalid,                      action: "SendComp (with B_CleanInvalid queued)" }
+  - { from: T_SNP_A,                                           event: REQ_B_ReadNoSnp__HAZARD,                                       to: T_SNP_A__PEND_B_ReadNoSnp,                         action: "queue B_ReadNoSnp; transient continues" }
+  - { from: T_SNP_A__PEND_B_ReadNoSnp,                         event: SNP_RESP_B_I_FOR_ReadClean,                                    to: T_ACK_A__PEND_B_ReadNoSnp,                         action: "SendCompData(SC) (with B_ReadNoSnp queued)" }
+  - { from: T_SNP_A__PEND_B_ReadNoSnp,                         event: SNP_RESP_B_SC_FOR_ReadClean,                                   to: T_ACK_A__PEND_B_ReadNoSnp,                         action: "SendCompData(SC) (with B_ReadNoSnp queued)" }
+  - { from: T_SNP_A__PEND_B_ReadNoSnp,                         event: SNP_RESP_B_I_FOR_ReadUnique,                                   to: T_ACK_A__PEND_B_ReadNoSnp,                         action: "SendCompData(UC) (with B_ReadNoSnp queued)" }
+  - { from: T_SNP_A__PEND_B_ReadNoSnp,                         event: SNP_RESP_B_I_FOR_CleanUnique,                                  to: T_ACK_A__PEND_B_ReadNoSnp,                         action: "SendComp(UC) (with B_ReadNoSnp queued)" }
+  - { from: T_SNP_A__PEND_B_ReadNoSnp,                         event: SNP_RESP_B_I_FOR_MakeUnique,                                   to: T_ACK_A__PEND_B_ReadNoSnp,                         action: "SendComp(UCE) (with B_ReadNoSnp queued)" }
+  - { from: T_SNP_A__PEND_B_ReadNoSnp,                         event: SNP_RESP_B_I_FOR_CleanInval,                                   to: T_ACK_A__PEND_B_ReadNoSnp,                         action: "SendComp (with B_ReadNoSnp queued)" }
+  - { from: T_SNP_A__PEND_B_ReadNoSnp,                         event: SNP_RESP_B_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_B_ReadNoSnp,                           action: "SendCompData(SC),BendsSC (with B_ReadNoSnp queued)" }
+  - { from: T_SNP_A__PEND_B_ReadNoSnp,                         event: SNP_RESP_B_SC_FOR_CleanShared,                                 to: T_ACK_A__PEND_B_ReadNoSnp,                         action: "SendComp (with B_ReadNoSnp queued)" }
+  - { from: T_SNP_A,                                           event: REQ_B_WriteNoSnpFull__HAZARD,                                  to: T_SNP_A__PEND_B_WriteNoSnpFull,                    action: "queue B_WriteNoSnpFull; transient continues" }
+  - { from: T_SNP_A__PEND_B_WriteNoSnpFull,                    event: SNP_RESP_B_I_FOR_ReadClean,                                    to: T_ACK_A__PEND_B_WriteNoSnpFull,                    action: "SendCompData(SC) (with B_WriteNoSnpFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteNoSnpFull,                    event: SNP_RESP_B_SC_FOR_ReadClean,                                   to: T_ACK_A__PEND_B_WriteNoSnpFull,                    action: "SendCompData(SC) (with B_WriteNoSnpFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteNoSnpFull,                    event: SNP_RESP_B_I_FOR_ReadUnique,                                   to: T_ACK_A__PEND_B_WriteNoSnpFull,                    action: "SendCompData(UC) (with B_WriteNoSnpFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteNoSnpFull,                    event: SNP_RESP_B_I_FOR_CleanUnique,                                  to: T_ACK_A__PEND_B_WriteNoSnpFull,                    action: "SendComp(UC) (with B_WriteNoSnpFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteNoSnpFull,                    event: SNP_RESP_B_I_FOR_MakeUnique,                                   to: T_ACK_A__PEND_B_WriteNoSnpFull,                    action: "SendComp(UCE) (with B_WriteNoSnpFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteNoSnpFull,                    event: SNP_RESP_B_I_FOR_CleanInval,                                   to: T_ACK_A__PEND_B_WriteNoSnpFull,                    action: "SendComp (with B_WriteNoSnpFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteNoSnpFull,                    event: SNP_RESP_B_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_B_WriteNoSnpFull,                      action: "SendCompData(SC),BendsSC (with B_WriteNoSnpFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteNoSnpFull,                    event: SNP_RESP_B_SC_FOR_CleanShared,                                 to: T_ACK_A__PEND_B_WriteNoSnpFull,                    action: "SendComp (with B_WriteNoSnpFull queued)" }
+  - { from: T_SNP_A,                                           event: REQ_B_WriteBackFull__HAZARD,                                   to: T_SNP_A__PEND_B_WriteBackFull,                     action: "queue B_WriteBackFull; transient continues" }
+  - { from: T_SNP_A__PEND_B_WriteBackFull,                     event: SNP_RESP_B_I_FOR_ReadClean,                                    to: T_ACK_A__PEND_B_WriteBackFull,                     action: "SendCompData(SC) (with B_WriteBackFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteBackFull,                     event: SNP_RESP_B_SC_FOR_ReadClean,                                   to: T_ACK_A__PEND_B_WriteBackFull,                     action: "SendCompData(SC) (with B_WriteBackFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteBackFull,                     event: SNP_RESP_B_I_FOR_ReadUnique,                                   to: T_ACK_A__PEND_B_WriteBackFull,                     action: "SendCompData(UC) (with B_WriteBackFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteBackFull,                     event: SNP_RESP_B_I_FOR_CleanUnique,                                  to: T_ACK_A__PEND_B_WriteBackFull,                     action: "SendComp(UC) (with B_WriteBackFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteBackFull,                     event: SNP_RESP_B_I_FOR_MakeUnique,                                   to: T_ACK_A__PEND_B_WriteBackFull,                     action: "SendComp(UCE) (with B_WriteBackFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteBackFull,                     event: SNP_RESP_B_I_FOR_CleanInval,                                   to: T_ACK_A__PEND_B_WriteBackFull,                     action: "SendComp (with B_WriteBackFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteBackFull,                     event: SNP_RESP_B_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_B_WriteBackFull,                       action: "SendCompData(SC),BendsSC (with B_WriteBackFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteBackFull,                     event: SNP_RESP_B_SC_FOR_CleanShared,                                 to: T_ACK_A__PEND_B_WriteBackFull,                     action: "SendComp (with B_WriteBackFull queued)" }
+  - { from: T_SNP_A,                                           event: REQ_B_WriteCleanFull__HAZARD,                                  to: T_SNP_A__PEND_B_WriteCleanFull,                    action: "queue B_WriteCleanFull; transient continues" }
+  - { from: T_SNP_A__PEND_B_WriteCleanFull,                    event: SNP_RESP_B_I_FOR_ReadClean,                                    to: T_ACK_A__PEND_B_WriteCleanFull,                    action: "SendCompData(SC) (with B_WriteCleanFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteCleanFull,                    event: SNP_RESP_B_SC_FOR_ReadClean,                                   to: T_ACK_A__PEND_B_WriteCleanFull,                    action: "SendCompData(SC) (with B_WriteCleanFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteCleanFull,                    event: SNP_RESP_B_I_FOR_ReadUnique,                                   to: T_ACK_A__PEND_B_WriteCleanFull,                    action: "SendCompData(UC) (with B_WriteCleanFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteCleanFull,                    event: SNP_RESP_B_I_FOR_CleanUnique,                                  to: T_ACK_A__PEND_B_WriteCleanFull,                    action: "SendComp(UC) (with B_WriteCleanFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteCleanFull,                    event: SNP_RESP_B_I_FOR_MakeUnique,                                   to: T_ACK_A__PEND_B_WriteCleanFull,                    action: "SendComp(UCE) (with B_WriteCleanFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteCleanFull,                    event: SNP_RESP_B_I_FOR_CleanInval,                                   to: T_ACK_A__PEND_B_WriteCleanFull,                    action: "SendComp (with B_WriteCleanFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteCleanFull,                    event: SNP_RESP_B_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_B_WriteCleanFull,                      action: "SendCompData(SC),BendsSC (with B_WriteCleanFull queued)" }
+  - { from: T_SNP_A__PEND_B_WriteCleanFull,                    event: SNP_RESP_B_SC_FOR_CleanShared,                                 to: T_ACK_A__PEND_B_WriteCleanFull,                    action: "SendComp (with B_WriteCleanFull queued)" }
+  - { from: T_SNP_B,                                           event: REQ_A_ReadClean__HAZARD,                                       to: T_SNP_B__PEND_A_ReadClean,                         action: "queue A_ReadClean; transient continues" }
+  - { from: T_SNP_B__PEND_A_ReadClean,                         event: SNP_RESP_A_I_FOR_ReadClean,                                    to: T_ACK_B__PEND_A_ReadClean,                         action: "SendCompData(SC) (with A_ReadClean queued)" }
+  - { from: T_SNP_B__PEND_A_ReadClean,                         event: SNP_RESP_A_SC_FOR_ReadClean,                                   to: T_ACK_B__PEND_A_ReadClean,                         action: "SendCompData(SC) (with A_ReadClean queued)" }
+  - { from: T_SNP_B__PEND_A_ReadClean,                         event: SNP_RESP_A_I_FOR_ReadUnique,                                   to: T_ACK_B__PEND_A_ReadClean,                         action: "SendCompData(UC) (with A_ReadClean queued)" }
+  - { from: T_SNP_B__PEND_A_ReadClean,                         event: SNP_RESP_A_I_FOR_CleanUnique,                                  to: T_ACK_B__PEND_A_ReadClean,                         action: "SendComp(UC) (with A_ReadClean queued)" }
+  - { from: T_SNP_B__PEND_A_ReadClean,                         event: SNP_RESP_A_I_FOR_MakeUnique,                                   to: T_ACK_B__PEND_A_ReadClean,                         action: "SendComp(UCE) (with A_ReadClean queued)" }
+  - { from: T_SNP_B__PEND_A_ReadClean,                         event: SNP_RESP_A_I_FOR_CleanInval,                                   to: T_ACK_B__PEND_A_ReadClean,                         action: "SendComp (with A_ReadClean queued)" }
+  - { from: T_SNP_B__PEND_A_ReadClean,                         event: SNP_RESP_A_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_A_ReadClean,                           action: "SendCompData(SC),AendsSC (with A_ReadClean queued)" }
+  - { from: T_SNP_B__PEND_A_ReadClean,                         event: SNP_RESP_A_SC_FOR_CleanShared,                                 to: T_ACK_B__PEND_A_ReadClean,                         action: "SendComp (with A_ReadClean queued)" }
+  - { from: T_SNP_B,                                           event: REQ_A_ReadUnique__HAZARD,                                      to: T_SNP_B__PEND_A_ReadUnique,                        action: "queue A_ReadUnique; transient continues" }
+  - { from: T_SNP_B__PEND_A_ReadUnique,                        event: SNP_RESP_A_I_FOR_ReadClean,                                    to: T_ACK_B__PEND_A_ReadUnique,                        action: "SendCompData(SC) (with A_ReadUnique queued)" }
+  - { from: T_SNP_B__PEND_A_ReadUnique,                        event: SNP_RESP_A_SC_FOR_ReadClean,                                   to: T_ACK_B__PEND_A_ReadUnique,                        action: "SendCompData(SC) (with A_ReadUnique queued)" }
+  - { from: T_SNP_B__PEND_A_ReadUnique,                        event: SNP_RESP_A_I_FOR_ReadUnique,                                   to: T_ACK_B__PEND_A_ReadUnique,                        action: "SendCompData(UC) (with A_ReadUnique queued)" }
+  - { from: T_SNP_B__PEND_A_ReadUnique,                        event: SNP_RESP_A_I_FOR_CleanUnique,                                  to: T_ACK_B__PEND_A_ReadUnique,                        action: "SendComp(UC) (with A_ReadUnique queued)" }
+  - { from: T_SNP_B__PEND_A_ReadUnique,                        event: SNP_RESP_A_I_FOR_MakeUnique,                                   to: T_ACK_B__PEND_A_ReadUnique,                        action: "SendComp(UCE) (with A_ReadUnique queued)" }
+  - { from: T_SNP_B__PEND_A_ReadUnique,                        event: SNP_RESP_A_I_FOR_CleanInval,                                   to: T_ACK_B__PEND_A_ReadUnique,                        action: "SendComp (with A_ReadUnique queued)" }
+  - { from: T_SNP_B__PEND_A_ReadUnique,                        event: SNP_RESP_A_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_A_ReadUnique,                          action: "SendCompData(SC),AendsSC (with A_ReadUnique queued)" }
+  - { from: T_SNP_B__PEND_A_ReadUnique,                        event: SNP_RESP_A_SC_FOR_CleanShared,                                 to: T_ACK_B__PEND_A_ReadUnique,                        action: "SendComp (with A_ReadUnique queued)" }
+  - { from: T_SNP_B,                                           event: REQ_A_MakeUnique__HAZARD,                                      to: T_SNP_B__PEND_A_MakeUnique,                        action: "queue A_MakeUnique; transient continues" }
+  - { from: T_SNP_B__PEND_A_MakeUnique,                        event: SNP_RESP_A_I_FOR_ReadClean,                                    to: T_ACK_B__PEND_A_MakeUnique,                        action: "SendCompData(SC) (with A_MakeUnique queued)" }
+  - { from: T_SNP_B__PEND_A_MakeUnique,                        event: SNP_RESP_A_SC_FOR_ReadClean,                                   to: T_ACK_B__PEND_A_MakeUnique,                        action: "SendCompData(SC) (with A_MakeUnique queued)" }
+  - { from: T_SNP_B__PEND_A_MakeUnique,                        event: SNP_RESP_A_I_FOR_ReadUnique,                                   to: T_ACK_B__PEND_A_MakeUnique,                        action: "SendCompData(UC) (with A_MakeUnique queued)" }
+  - { from: T_SNP_B__PEND_A_MakeUnique,                        event: SNP_RESP_A_I_FOR_CleanUnique,                                  to: T_ACK_B__PEND_A_MakeUnique,                        action: "SendComp(UC) (with A_MakeUnique queued)" }
+  - { from: T_SNP_B__PEND_A_MakeUnique,                        event: SNP_RESP_A_I_FOR_MakeUnique,                                   to: T_ACK_B__PEND_A_MakeUnique,                        action: "SendComp(UCE) (with A_MakeUnique queued)" }
+  - { from: T_SNP_B__PEND_A_MakeUnique,                        event: SNP_RESP_A_I_FOR_CleanInval,                                   to: T_ACK_B__PEND_A_MakeUnique,                        action: "SendComp (with A_MakeUnique queued)" }
+  - { from: T_SNP_B__PEND_A_MakeUnique,                        event: SNP_RESP_A_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_A_MakeUnique,                          action: "SendCompData(SC),AendsSC (with A_MakeUnique queued)" }
+  - { from: T_SNP_B__PEND_A_MakeUnique,                        event: SNP_RESP_A_SC_FOR_CleanShared,                                 to: T_ACK_B__PEND_A_MakeUnique,                        action: "SendComp (with A_MakeUnique queued)" }
+  - { from: T_SNP_B,                                           event: REQ_A_CleanShared__HAZARD,                                     to: T_SNP_B__PEND_A_CleanShared,                       action: "queue A_CleanShared; transient continues" }
+  - { from: T_SNP_B__PEND_A_CleanShared,                       event: SNP_RESP_A_I_FOR_ReadClean,                                    to: T_ACK_B__PEND_A_CleanShared,                       action: "SendCompData(SC) (with A_CleanShared queued)" }
+  - { from: T_SNP_B__PEND_A_CleanShared,                       event: SNP_RESP_A_SC_FOR_ReadClean,                                   to: T_ACK_B__PEND_A_CleanShared,                       action: "SendCompData(SC) (with A_CleanShared queued)" }
+  - { from: T_SNP_B__PEND_A_CleanShared,                       event: SNP_RESP_A_I_FOR_ReadUnique,                                   to: T_ACK_B__PEND_A_CleanShared,                       action: "SendCompData(UC) (with A_CleanShared queued)" }
+  - { from: T_SNP_B__PEND_A_CleanShared,                       event: SNP_RESP_A_I_FOR_CleanUnique,                                  to: T_ACK_B__PEND_A_CleanShared,                       action: "SendComp(UC) (with A_CleanShared queued)" }
+  - { from: T_SNP_B__PEND_A_CleanShared,                       event: SNP_RESP_A_I_FOR_MakeUnique,                                   to: T_ACK_B__PEND_A_CleanShared,                       action: "SendComp(UCE) (with A_CleanShared queued)" }
+  - { from: T_SNP_B__PEND_A_CleanShared,                       event: SNP_RESP_A_I_FOR_CleanInval,                                   to: T_ACK_B__PEND_A_CleanShared,                       action: "SendComp (with A_CleanShared queued)" }
+  - { from: T_SNP_B__PEND_A_CleanShared,                       event: SNP_RESP_A_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_A_CleanShared,                         action: "SendCompData(SC),AendsSC (with A_CleanShared queued)" }
+  - { from: T_SNP_B__PEND_A_CleanShared,                       event: SNP_RESP_A_SC_FOR_CleanShared,                                 to: T_ACK_B__PEND_A_CleanShared,                       action: "SendComp (with A_CleanShared queued)" }
+  - { from: T_SNP_B,                                           event: REQ_A_CleanUnique__HAZARD,                                     to: T_SNP_B__PEND_A_CleanUnique,                       action: "queue A_CleanUnique; transient continues" }
+  - { from: T_SNP_B__PEND_A_CleanUnique,                       event: SNP_RESP_A_I_FOR_ReadClean,                                    to: T_ACK_B__PEND_A_CleanUnique,                       action: "SendCompData(SC) (with A_CleanUnique queued)" }
+  - { from: T_SNP_B__PEND_A_CleanUnique,                       event: SNP_RESP_A_SC_FOR_ReadClean,                                   to: T_ACK_B__PEND_A_CleanUnique,                       action: "SendCompData(SC) (with A_CleanUnique queued)" }
+  - { from: T_SNP_B__PEND_A_CleanUnique,                       event: SNP_RESP_A_I_FOR_ReadUnique,                                   to: T_ACK_B__PEND_A_CleanUnique,                       action: "SendCompData(UC) (with A_CleanUnique queued)" }
+  - { from: T_SNP_B__PEND_A_CleanUnique,                       event: SNP_RESP_A_I_FOR_CleanUnique,                                  to: T_ACK_B__PEND_A_CleanUnique,                       action: "SendComp(UC) (with A_CleanUnique queued)" }
+  - { from: T_SNP_B__PEND_A_CleanUnique,                       event: SNP_RESP_A_I_FOR_MakeUnique,                                   to: T_ACK_B__PEND_A_CleanUnique,                       action: "SendComp(UCE) (with A_CleanUnique queued)" }
+  - { from: T_SNP_B__PEND_A_CleanUnique,                       event: SNP_RESP_A_I_FOR_CleanInval,                                   to: T_ACK_B__PEND_A_CleanUnique,                       action: "SendComp (with A_CleanUnique queued)" }
+  - { from: T_SNP_B__PEND_A_CleanUnique,                       event: SNP_RESP_A_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_A_CleanUnique,                         action: "SendCompData(SC),AendsSC (with A_CleanUnique queued)" }
+  - { from: T_SNP_B__PEND_A_CleanUnique,                       event: SNP_RESP_A_SC_FOR_CleanShared,                                 to: T_ACK_B__PEND_A_CleanUnique,                       action: "SendComp (with A_CleanUnique queued)" }
+  - { from: T_SNP_B,                                           event: REQ_A_CleanInvalid__HAZARD,                                    to: T_SNP_B__PEND_A_CleanInvalid,                      action: "queue A_CleanInvalid; transient continues" }
+  - { from: T_SNP_B__PEND_A_CleanInvalid,                      event: SNP_RESP_A_I_FOR_ReadClean,                                    to: T_ACK_B__PEND_A_CleanInvalid,                      action: "SendCompData(SC) (with A_CleanInvalid queued)" }
+  - { from: T_SNP_B__PEND_A_CleanInvalid,                      event: SNP_RESP_A_SC_FOR_ReadClean,                                   to: T_ACK_B__PEND_A_CleanInvalid,                      action: "SendCompData(SC) (with A_CleanInvalid queued)" }
+  - { from: T_SNP_B__PEND_A_CleanInvalid,                      event: SNP_RESP_A_I_FOR_ReadUnique,                                   to: T_ACK_B__PEND_A_CleanInvalid,                      action: "SendCompData(UC) (with A_CleanInvalid queued)" }
+  - { from: T_SNP_B__PEND_A_CleanInvalid,                      event: SNP_RESP_A_I_FOR_CleanUnique,                                  to: T_ACK_B__PEND_A_CleanInvalid,                      action: "SendComp(UC) (with A_CleanInvalid queued)" }
+  - { from: T_SNP_B__PEND_A_CleanInvalid,                      event: SNP_RESP_A_I_FOR_MakeUnique,                                   to: T_ACK_B__PEND_A_CleanInvalid,                      action: "SendComp(UCE) (with A_CleanInvalid queued)" }
+  - { from: T_SNP_B__PEND_A_CleanInvalid,                      event: SNP_RESP_A_I_FOR_CleanInval,                                   to: T_ACK_B__PEND_A_CleanInvalid,                      action: "SendComp (with A_CleanInvalid queued)" }
+  - { from: T_SNP_B__PEND_A_CleanInvalid,                      event: SNP_RESP_A_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_A_CleanInvalid,                        action: "SendCompData(SC),AendsSC (with A_CleanInvalid queued)" }
+  - { from: T_SNP_B__PEND_A_CleanInvalid,                      event: SNP_RESP_A_SC_FOR_CleanShared,                                 to: T_ACK_B__PEND_A_CleanInvalid,                      action: "SendComp (with A_CleanInvalid queued)" }
+  - { from: T_SNP_B,                                           event: REQ_A_ReadNoSnp__HAZARD,                                       to: T_SNP_B__PEND_A_ReadNoSnp,                         action: "queue A_ReadNoSnp; transient continues" }
+  - { from: T_SNP_B__PEND_A_ReadNoSnp,                         event: SNP_RESP_A_I_FOR_ReadClean,                                    to: T_ACK_B__PEND_A_ReadNoSnp,                         action: "SendCompData(SC) (with A_ReadNoSnp queued)" }
+  - { from: T_SNP_B__PEND_A_ReadNoSnp,                         event: SNP_RESP_A_SC_FOR_ReadClean,                                   to: T_ACK_B__PEND_A_ReadNoSnp,                         action: "SendCompData(SC) (with A_ReadNoSnp queued)" }
+  - { from: T_SNP_B__PEND_A_ReadNoSnp,                         event: SNP_RESP_A_I_FOR_ReadUnique,                                   to: T_ACK_B__PEND_A_ReadNoSnp,                         action: "SendCompData(UC) (with A_ReadNoSnp queued)" }
+  - { from: T_SNP_B__PEND_A_ReadNoSnp,                         event: SNP_RESP_A_I_FOR_CleanUnique,                                  to: T_ACK_B__PEND_A_ReadNoSnp,                         action: "SendComp(UC) (with A_ReadNoSnp queued)" }
+  - { from: T_SNP_B__PEND_A_ReadNoSnp,                         event: SNP_RESP_A_I_FOR_MakeUnique,                                   to: T_ACK_B__PEND_A_ReadNoSnp,                         action: "SendComp(UCE) (with A_ReadNoSnp queued)" }
+  - { from: T_SNP_B__PEND_A_ReadNoSnp,                         event: SNP_RESP_A_I_FOR_CleanInval,                                   to: T_ACK_B__PEND_A_ReadNoSnp,                         action: "SendComp (with A_ReadNoSnp queued)" }
+  - { from: T_SNP_B__PEND_A_ReadNoSnp,                         event: SNP_RESP_A_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_A_ReadNoSnp,                           action: "SendCompData(SC),AendsSC (with A_ReadNoSnp queued)" }
+  - { from: T_SNP_B__PEND_A_ReadNoSnp,                         event: SNP_RESP_A_SC_FOR_CleanShared,                                 to: T_ACK_B__PEND_A_ReadNoSnp,                         action: "SendComp (with A_ReadNoSnp queued)" }
+  - { from: T_SNP_B,                                           event: REQ_A_WriteNoSnpFull__HAZARD,                                  to: T_SNP_B__PEND_A_WriteNoSnpFull,                    action: "queue A_WriteNoSnpFull; transient continues" }
+  - { from: T_SNP_B__PEND_A_WriteNoSnpFull,                    event: SNP_RESP_A_I_FOR_ReadClean,                                    to: T_ACK_B__PEND_A_WriteNoSnpFull,                    action: "SendCompData(SC) (with A_WriteNoSnpFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteNoSnpFull,                    event: SNP_RESP_A_SC_FOR_ReadClean,                                   to: T_ACK_B__PEND_A_WriteNoSnpFull,                    action: "SendCompData(SC) (with A_WriteNoSnpFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteNoSnpFull,                    event: SNP_RESP_A_I_FOR_ReadUnique,                                   to: T_ACK_B__PEND_A_WriteNoSnpFull,                    action: "SendCompData(UC) (with A_WriteNoSnpFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteNoSnpFull,                    event: SNP_RESP_A_I_FOR_CleanUnique,                                  to: T_ACK_B__PEND_A_WriteNoSnpFull,                    action: "SendComp(UC) (with A_WriteNoSnpFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteNoSnpFull,                    event: SNP_RESP_A_I_FOR_MakeUnique,                                   to: T_ACK_B__PEND_A_WriteNoSnpFull,                    action: "SendComp(UCE) (with A_WriteNoSnpFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteNoSnpFull,                    event: SNP_RESP_A_I_FOR_CleanInval,                                   to: T_ACK_B__PEND_A_WriteNoSnpFull,                    action: "SendComp (with A_WriteNoSnpFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteNoSnpFull,                    event: SNP_RESP_A_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_A_WriteNoSnpFull,                      action: "SendCompData(SC),AendsSC (with A_WriteNoSnpFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteNoSnpFull,                    event: SNP_RESP_A_SC_FOR_CleanShared,                                 to: T_ACK_B__PEND_A_WriteNoSnpFull,                    action: "SendComp (with A_WriteNoSnpFull queued)" }
+  - { from: T_SNP_B,                                           event: REQ_A_WriteBackFull__HAZARD,                                   to: T_SNP_B__PEND_A_WriteBackFull,                     action: "queue A_WriteBackFull; transient continues" }
+  - { from: T_SNP_B__PEND_A_WriteBackFull,                     event: SNP_RESP_A_I_FOR_ReadClean,                                    to: T_ACK_B__PEND_A_WriteBackFull,                     action: "SendCompData(SC) (with A_WriteBackFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteBackFull,                     event: SNP_RESP_A_SC_FOR_ReadClean,                                   to: T_ACK_B__PEND_A_WriteBackFull,                     action: "SendCompData(SC) (with A_WriteBackFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteBackFull,                     event: SNP_RESP_A_I_FOR_ReadUnique,                                   to: T_ACK_B__PEND_A_WriteBackFull,                     action: "SendCompData(UC) (with A_WriteBackFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteBackFull,                     event: SNP_RESP_A_I_FOR_CleanUnique,                                  to: T_ACK_B__PEND_A_WriteBackFull,                     action: "SendComp(UC) (with A_WriteBackFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteBackFull,                     event: SNP_RESP_A_I_FOR_MakeUnique,                                   to: T_ACK_B__PEND_A_WriteBackFull,                     action: "SendComp(UCE) (with A_WriteBackFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteBackFull,                     event: SNP_RESP_A_I_FOR_CleanInval,                                   to: T_ACK_B__PEND_A_WriteBackFull,                     action: "SendComp (with A_WriteBackFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteBackFull,                     event: SNP_RESP_A_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_A_WriteBackFull,                       action: "SendCompData(SC),AendsSC (with A_WriteBackFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteBackFull,                     event: SNP_RESP_A_SC_FOR_CleanShared,                                 to: T_ACK_B__PEND_A_WriteBackFull,                     action: "SendComp (with A_WriteBackFull queued)" }
+  - { from: T_SNP_B,                                           event: REQ_A_WriteCleanFull__HAZARD,                                  to: T_SNP_B__PEND_A_WriteCleanFull,                    action: "queue A_WriteCleanFull; transient continues" }
+  - { from: T_SNP_B__PEND_A_WriteCleanFull,                    event: SNP_RESP_A_I_FOR_ReadClean,                                    to: T_ACK_B__PEND_A_WriteCleanFull,                    action: "SendCompData(SC) (with A_WriteCleanFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteCleanFull,                    event: SNP_RESP_A_SC_FOR_ReadClean,                                   to: T_ACK_B__PEND_A_WriteCleanFull,                    action: "SendCompData(SC) (with A_WriteCleanFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteCleanFull,                    event: SNP_RESP_A_I_FOR_ReadUnique,                                   to: T_ACK_B__PEND_A_WriteCleanFull,                    action: "SendCompData(UC) (with A_WriteCleanFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteCleanFull,                    event: SNP_RESP_A_I_FOR_CleanUnique,                                  to: T_ACK_B__PEND_A_WriteCleanFull,                    action: "SendComp(UC) (with A_WriteCleanFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteCleanFull,                    event: SNP_RESP_A_I_FOR_MakeUnique,                                   to: T_ACK_B__PEND_A_WriteCleanFull,                    action: "SendComp(UCE) (with A_WriteCleanFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteCleanFull,                    event: SNP_RESP_A_I_FOR_CleanInval,                                   to: T_ACK_B__PEND_A_WriteCleanFull,                    action: "SendComp (with A_WriteCleanFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteCleanFull,                    event: SNP_RESP_A_SC_FOR_ReadClean_FROM_UC,                           to: SC_AB__PEND_A_WriteCleanFull,                      action: "SendCompData(SC),AendsSC (with A_WriteCleanFull queued)" }
+  - { from: T_SNP_B__PEND_A_WriteCleanFull,                    event: SNP_RESP_A_SC_FOR_CleanShared,                                 to: T_ACK_B__PEND_A_WriteCleanFull,                    action: "SendComp (with A_WriteCleanFull queued)" }
+  - { from: T_ACK_A,                                           event: REQ_B_ReadClean__HAZARD,                                       to: T_ACK_A__PEND_B_ReadClean,                         action: "queue B_ReadClean; transient continues" }
+  - { from: T_ACK_A__PEND_B_ReadClean,                         event: COMPACK_A_ReadClean,                                           to: SC_A__PEND_B_ReadClean,                            action: "RetireMSHR (with B_ReadClean queued)" }
+  - { from: T_ACK_A__PEND_B_ReadClean,                         event: COMPACK_A_ReadUnique,                                          to: UC_A__PEND_B_ReadClean,                            action: "RetireMSHR (with B_ReadClean queued)" }
+  - { from: T_ACK_A__PEND_B_ReadClean,                         event: COMPACK_A_MakeUnique,                                          to: UC_A__PEND_B_ReadClean,                            action: "RetireMSHR (with B_ReadClean queued)" }
+  - { from: T_ACK_A__PEND_B_ReadClean,                         event: COMPACK_A_CleanUnique,                                         to: UC_A__PEND_B_ReadClean,                            action: "RetireMSHR (with B_ReadClean queued)" }
+  - { from: T_ACK_A__PEND_B_ReadClean,                         event: COMPACK_A_CleanInval,                                          to: I__PEND_B_ReadClean,                               action: "RetireMSHR (with B_ReadClean queued)" }
+  - { from: T_ACK_A__PEND_B_ReadClean,                         event: COMPACK_A_CleanShared,                                         to: I__PEND_B_ReadClean,                               action: "RetireMSHR (with B_ReadClean queued)" }
+  - { from: T_ACK_A,                                           event: REQ_B_ReadUnique__HAZARD,                                      to: T_ACK_A__PEND_B_ReadUnique,                        action: "queue B_ReadUnique; transient continues" }
+  - { from: T_ACK_A__PEND_B_ReadUnique,                        event: COMPACK_A_ReadClean,                                           to: SC_A__PEND_B_ReadUnique,                           action: "RetireMSHR (with B_ReadUnique queued)" }
+  - { from: T_ACK_A__PEND_B_ReadUnique,                        event: COMPACK_A_ReadUnique,                                          to: UC_A__PEND_B_ReadUnique,                           action: "RetireMSHR (with B_ReadUnique queued)" }
+  - { from: T_ACK_A__PEND_B_ReadUnique,                        event: COMPACK_A_MakeUnique,                                          to: UC_A__PEND_B_ReadUnique,                           action: "RetireMSHR (with B_ReadUnique queued)" }
+  - { from: T_ACK_A__PEND_B_ReadUnique,                        event: COMPACK_A_CleanUnique,                                         to: UC_A__PEND_B_ReadUnique,                           action: "RetireMSHR (with B_ReadUnique queued)" }
+  - { from: T_ACK_A__PEND_B_ReadUnique,                        event: COMPACK_A_CleanInval,                                          to: I__PEND_B_ReadUnique,                              action: "RetireMSHR (with B_ReadUnique queued)" }
+  - { from: T_ACK_A__PEND_B_ReadUnique,                        event: COMPACK_A_CleanShared,                                         to: I__PEND_B_ReadUnique,                              action: "RetireMSHR (with B_ReadUnique queued)" }
+  - { from: T_ACK_A,                                           event: REQ_B_MakeUnique__HAZARD,                                      to: T_ACK_A__PEND_B_MakeUnique,                        action: "queue B_MakeUnique; transient continues" }
+  - { from: T_ACK_A__PEND_B_MakeUnique,                        event: COMPACK_A_ReadClean,                                           to: SC_A__PEND_B_MakeUnique,                           action: "RetireMSHR (with B_MakeUnique queued)" }
+  - { from: T_ACK_A__PEND_B_MakeUnique,                        event: COMPACK_A_ReadUnique,                                          to: UC_A__PEND_B_MakeUnique,                           action: "RetireMSHR (with B_MakeUnique queued)" }
+  - { from: T_ACK_A__PEND_B_MakeUnique,                        event: COMPACK_A_MakeUnique,                                          to: UC_A__PEND_B_MakeUnique,                           action: "RetireMSHR (with B_MakeUnique queued)" }
+  - { from: T_ACK_A__PEND_B_MakeUnique,                        event: COMPACK_A_CleanUnique,                                         to: UC_A__PEND_B_MakeUnique,                           action: "RetireMSHR (with B_MakeUnique queued)" }
+  - { from: T_ACK_A__PEND_B_MakeUnique,                        event: COMPACK_A_CleanInval,                                          to: I__PEND_B_MakeUnique,                              action: "RetireMSHR (with B_MakeUnique queued)" }
+  - { from: T_ACK_A__PEND_B_MakeUnique,                        event: COMPACK_A_CleanShared,                                         to: I__PEND_B_MakeUnique,                              action: "RetireMSHR (with B_MakeUnique queued)" }
+  - { from: T_ACK_A,                                           event: REQ_B_CleanShared__HAZARD,                                     to: T_ACK_A__PEND_B_CleanShared,                       action: "queue B_CleanShared; transient continues" }
+  - { from: T_ACK_A__PEND_B_CleanShared,                       event: COMPACK_A_ReadClean,                                           to: SC_A__PEND_B_CleanShared,                          action: "RetireMSHR (with B_CleanShared queued)" }
+  - { from: T_ACK_A__PEND_B_CleanShared,                       event: COMPACK_A_ReadUnique,                                          to: UC_A__PEND_B_CleanShared,                          action: "RetireMSHR (with B_CleanShared queued)" }
+  - { from: T_ACK_A__PEND_B_CleanShared,                       event: COMPACK_A_MakeUnique,                                          to: UC_A__PEND_B_CleanShared,                          action: "RetireMSHR (with B_CleanShared queued)" }
+  - { from: T_ACK_A__PEND_B_CleanShared,                       event: COMPACK_A_CleanUnique,                                         to: UC_A__PEND_B_CleanShared,                          action: "RetireMSHR (with B_CleanShared queued)" }
+  - { from: T_ACK_A__PEND_B_CleanShared,                       event: COMPACK_A_CleanInval,                                          to: I__PEND_B_CleanShared,                             action: "RetireMSHR (with B_CleanShared queued)" }
+  - { from: T_ACK_A__PEND_B_CleanShared,                       event: COMPACK_A_CleanShared,                                         to: I__PEND_B_CleanShared,                             action: "RetireMSHR (with B_CleanShared queued)" }
+  - { from: T_ACK_A,                                           event: REQ_B_CleanUnique__HAZARD,                                     to: T_ACK_A__PEND_B_CleanUnique,                       action: "queue B_CleanUnique; transient continues" }
+  - { from: T_ACK_A__PEND_B_CleanUnique,                       event: COMPACK_A_ReadClean,                                           to: SC_A__PEND_B_CleanUnique,                          action: "RetireMSHR (with B_CleanUnique queued)" }
+  - { from: T_ACK_A__PEND_B_CleanUnique,                       event: COMPACK_A_ReadUnique,                                          to: UC_A__PEND_B_CleanUnique,                          action: "RetireMSHR (with B_CleanUnique queued)" }
+  - { from: T_ACK_A__PEND_B_CleanUnique,                       event: COMPACK_A_MakeUnique,                                          to: UC_A__PEND_B_CleanUnique,                          action: "RetireMSHR (with B_CleanUnique queued)" }
+  - { from: T_ACK_A__PEND_B_CleanUnique,                       event: COMPACK_A_CleanUnique,                                         to: UC_A__PEND_B_CleanUnique,                          action: "RetireMSHR (with B_CleanUnique queued)" }
+  - { from: T_ACK_A__PEND_B_CleanUnique,                       event: COMPACK_A_CleanInval,                                          to: I__PEND_B_CleanUnique,                             action: "RetireMSHR (with B_CleanUnique queued)" }
+  - { from: T_ACK_A__PEND_B_CleanUnique,                       event: COMPACK_A_CleanShared,                                         to: I__PEND_B_CleanUnique,                             action: "RetireMSHR (with B_CleanUnique queued)" }
+  - { from: T_ACK_A,                                           event: REQ_B_CleanInvalid__HAZARD,                                    to: T_ACK_A__PEND_B_CleanInvalid,                      action: "queue B_CleanInvalid; transient continues" }
+  - { from: T_ACK_A__PEND_B_CleanInvalid,                      event: COMPACK_A_ReadClean,                                           to: SC_A__PEND_B_CleanInvalid,                         action: "RetireMSHR (with B_CleanInvalid queued)" }
+  - { from: T_ACK_A__PEND_B_CleanInvalid,                      event: COMPACK_A_ReadUnique,                                          to: UC_A__PEND_B_CleanInvalid,                         action: "RetireMSHR (with B_CleanInvalid queued)" }
+  - { from: T_ACK_A__PEND_B_CleanInvalid,                      event: COMPACK_A_MakeUnique,                                          to: UC_A__PEND_B_CleanInvalid,                         action: "RetireMSHR (with B_CleanInvalid queued)" }
+  - { from: T_ACK_A__PEND_B_CleanInvalid,                      event: COMPACK_A_CleanUnique,                                         to: UC_A__PEND_B_CleanInvalid,                         action: "RetireMSHR (with B_CleanInvalid queued)" }
+  - { from: T_ACK_A__PEND_B_CleanInvalid,                      event: COMPACK_A_CleanInval,                                          to: I__PEND_B_CleanInvalid,                            action: "RetireMSHR (with B_CleanInvalid queued)" }
+  - { from: T_ACK_A__PEND_B_CleanInvalid,                      event: COMPACK_A_CleanShared,                                         to: I__PEND_B_CleanInvalid,                            action: "RetireMSHR (with B_CleanInvalid queued)" }
+  - { from: T_ACK_A,                                           event: REQ_B_ReadNoSnp__HAZARD,                                       to: T_ACK_A__PEND_B_ReadNoSnp,                         action: "queue B_ReadNoSnp; transient continues" }
+  - { from: T_ACK_A__PEND_B_ReadNoSnp,                         event: COMPACK_A_ReadClean,                                           to: SC_A__PEND_B_ReadNoSnp,                            action: "RetireMSHR (with B_ReadNoSnp queued)" }
+  - { from: T_ACK_A__PEND_B_ReadNoSnp,                         event: COMPACK_A_ReadUnique,                                          to: UC_A__PEND_B_ReadNoSnp,                            action: "RetireMSHR (with B_ReadNoSnp queued)" }
+  - { from: T_ACK_A__PEND_B_ReadNoSnp,                         event: COMPACK_A_MakeUnique,                                          to: UC_A__PEND_B_ReadNoSnp,                            action: "RetireMSHR (with B_ReadNoSnp queued)" }
+  - { from: T_ACK_A__PEND_B_ReadNoSnp,                         event: COMPACK_A_CleanUnique,                                         to: UC_A__PEND_B_ReadNoSnp,                            action: "RetireMSHR (with B_ReadNoSnp queued)" }
+  - { from: T_ACK_A__PEND_B_ReadNoSnp,                         event: COMPACK_A_CleanInval,                                          to: I__PEND_B_ReadNoSnp,                               action: "RetireMSHR (with B_ReadNoSnp queued)" }
+  - { from: T_ACK_A__PEND_B_ReadNoSnp,                         event: COMPACK_A_CleanShared,                                         to: I__PEND_B_ReadNoSnp,                               action: "RetireMSHR (with B_ReadNoSnp queued)" }
+  - { from: T_ACK_A,                                           event: REQ_B_WriteNoSnpFull__HAZARD,                                  to: T_ACK_A__PEND_B_WriteNoSnpFull,                    action: "queue B_WriteNoSnpFull; transient continues" }
+  - { from: T_ACK_A__PEND_B_WriteNoSnpFull,                    event: COMPACK_A_ReadClean,                                           to: SC_A__PEND_B_WriteNoSnpFull,                       action: "RetireMSHR (with B_WriteNoSnpFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteNoSnpFull,                    event: COMPACK_A_ReadUnique,                                          to: UC_A__PEND_B_WriteNoSnpFull,                       action: "RetireMSHR (with B_WriteNoSnpFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteNoSnpFull,                    event: COMPACK_A_MakeUnique,                                          to: UC_A__PEND_B_WriteNoSnpFull,                       action: "RetireMSHR (with B_WriteNoSnpFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteNoSnpFull,                    event: COMPACK_A_CleanUnique,                                         to: UC_A__PEND_B_WriteNoSnpFull,                       action: "RetireMSHR (with B_WriteNoSnpFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteNoSnpFull,                    event: COMPACK_A_CleanInval,                                          to: I__PEND_B_WriteNoSnpFull,                          action: "RetireMSHR (with B_WriteNoSnpFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteNoSnpFull,                    event: COMPACK_A_CleanShared,                                         to: I__PEND_B_WriteNoSnpFull,                          action: "RetireMSHR (with B_WriteNoSnpFull queued)" }
+  - { from: T_ACK_A,                                           event: REQ_B_WriteBackFull__HAZARD,                                   to: T_ACK_A__PEND_B_WriteBackFull,                     action: "queue B_WriteBackFull; transient continues" }
+  - { from: T_ACK_A__PEND_B_WriteBackFull,                     event: COMPACK_A_ReadClean,                                           to: SC_A__PEND_B_WriteBackFull,                        action: "RetireMSHR (with B_WriteBackFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteBackFull,                     event: COMPACK_A_ReadUnique,                                          to: UC_A__PEND_B_WriteBackFull,                        action: "RetireMSHR (with B_WriteBackFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteBackFull,                     event: COMPACK_A_MakeUnique,                                          to: UC_A__PEND_B_WriteBackFull,                        action: "RetireMSHR (with B_WriteBackFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteBackFull,                     event: COMPACK_A_CleanUnique,                                         to: UC_A__PEND_B_WriteBackFull,                        action: "RetireMSHR (with B_WriteBackFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteBackFull,                     event: COMPACK_A_CleanInval,                                          to: I__PEND_B_WriteBackFull,                           action: "RetireMSHR (with B_WriteBackFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteBackFull,                     event: COMPACK_A_CleanShared,                                         to: I__PEND_B_WriteBackFull,                           action: "RetireMSHR (with B_WriteBackFull queued)" }
+  - { from: T_ACK_A,                                           event: REQ_B_WriteCleanFull__HAZARD,                                  to: T_ACK_A__PEND_B_WriteCleanFull,                    action: "queue B_WriteCleanFull; transient continues" }
+  - { from: T_ACK_A__PEND_B_WriteCleanFull,                    event: COMPACK_A_ReadClean,                                           to: SC_A__PEND_B_WriteCleanFull,                       action: "RetireMSHR (with B_WriteCleanFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteCleanFull,                    event: COMPACK_A_ReadUnique,                                          to: UC_A__PEND_B_WriteCleanFull,                       action: "RetireMSHR (with B_WriteCleanFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteCleanFull,                    event: COMPACK_A_MakeUnique,                                          to: UC_A__PEND_B_WriteCleanFull,                       action: "RetireMSHR (with B_WriteCleanFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteCleanFull,                    event: COMPACK_A_CleanUnique,                                         to: UC_A__PEND_B_WriteCleanFull,                       action: "RetireMSHR (with B_WriteCleanFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteCleanFull,                    event: COMPACK_A_CleanInval,                                          to: I__PEND_B_WriteCleanFull,                          action: "RetireMSHR (with B_WriteCleanFull queued)" }
+  - { from: T_ACK_A__PEND_B_WriteCleanFull,                    event: COMPACK_A_CleanShared,                                         to: I__PEND_B_WriteCleanFull,                          action: "RetireMSHR (with B_WriteCleanFull queued)" }
+  - { from: T_ACK_B,                                           event: REQ_A_ReadClean__HAZARD,                                       to: T_ACK_B__PEND_A_ReadClean,                         action: "queue A_ReadClean; transient continues" }
+  - { from: T_ACK_B__PEND_A_ReadClean,                         event: COMPACK_B_ReadClean,                                           to: SC_B__PEND_A_ReadClean,                            action: "RetireMSHR (with A_ReadClean queued)" }
+  - { from: T_ACK_B__PEND_A_ReadClean,                         event: COMPACK_B_ReadUnique,                                          to: UC_B__PEND_A_ReadClean,                            action: "RetireMSHR (with A_ReadClean queued)" }
+  - { from: T_ACK_B__PEND_A_ReadClean,                         event: COMPACK_B_MakeUnique,                                          to: UC_B__PEND_A_ReadClean,                            action: "RetireMSHR (with A_ReadClean queued)" }
+  - { from: T_ACK_B__PEND_A_ReadClean,                         event: COMPACK_B_CleanUnique,                                         to: UC_B__PEND_A_ReadClean,                            action: "RetireMSHR (with A_ReadClean queued)" }
+  - { from: T_ACK_B__PEND_A_ReadClean,                         event: COMPACK_B_CleanInval,                                          to: I__PEND_A_ReadClean,                               action: "RetireMSHR (with A_ReadClean queued)" }
+  - { from: T_ACK_B__PEND_A_ReadClean,                         event: COMPACK_B_CleanShared,                                         to: I__PEND_A_ReadClean,                               action: "RetireMSHR (with A_ReadClean queued)" }
+  - { from: T_ACK_B,                                           event: REQ_A_ReadUnique__HAZARD,                                      to: T_ACK_B__PEND_A_ReadUnique,                        action: "queue A_ReadUnique; transient continues" }
+  - { from: T_ACK_B__PEND_A_ReadUnique,                        event: COMPACK_B_ReadClean,                                           to: SC_B__PEND_A_ReadUnique,                           action: "RetireMSHR (with A_ReadUnique queued)" }
+  - { from: T_ACK_B__PEND_A_ReadUnique,                        event: COMPACK_B_ReadUnique,                                          to: UC_B__PEND_A_ReadUnique,                           action: "RetireMSHR (with A_ReadUnique queued)" }
+  - { from: T_ACK_B__PEND_A_ReadUnique,                        event: COMPACK_B_MakeUnique,                                          to: UC_B__PEND_A_ReadUnique,                           action: "RetireMSHR (with A_ReadUnique queued)" }
+  - { from: T_ACK_B__PEND_A_ReadUnique,                        event: COMPACK_B_CleanUnique,                                         to: UC_B__PEND_A_ReadUnique,                           action: "RetireMSHR (with A_ReadUnique queued)" }
+  - { from: T_ACK_B__PEND_A_ReadUnique,                        event: COMPACK_B_CleanInval,                                          to: I__PEND_A_ReadUnique,                              action: "RetireMSHR (with A_ReadUnique queued)" }
+  - { from: T_ACK_B__PEND_A_ReadUnique,                        event: COMPACK_B_CleanShared,                                         to: I__PEND_A_ReadUnique,                              action: "RetireMSHR (with A_ReadUnique queued)" }
+  - { from: T_ACK_B,                                           event: REQ_A_MakeUnique__HAZARD,                                      to: T_ACK_B__PEND_A_MakeUnique,                        action: "queue A_MakeUnique; transient continues" }
+  - { from: T_ACK_B__PEND_A_MakeUnique,                        event: COMPACK_B_ReadClean,                                           to: SC_B__PEND_A_MakeUnique,                           action: "RetireMSHR (with A_MakeUnique queued)" }
+  - { from: T_ACK_B__PEND_A_MakeUnique,                        event: COMPACK_B_ReadUnique,                                          to: UC_B__PEND_A_MakeUnique,                           action: "RetireMSHR (with A_MakeUnique queued)" }
+  - { from: T_ACK_B__PEND_A_MakeUnique,                        event: COMPACK_B_MakeUnique,                                          to: UC_B__PEND_A_MakeUnique,                           action: "RetireMSHR (with A_MakeUnique queued)" }
+  - { from: T_ACK_B__PEND_A_MakeUnique,                        event: COMPACK_B_CleanUnique,                                         to: UC_B__PEND_A_MakeUnique,                           action: "RetireMSHR (with A_MakeUnique queued)" }
+  - { from: T_ACK_B__PEND_A_MakeUnique,                        event: COMPACK_B_CleanInval,                                          to: I__PEND_A_MakeUnique,                              action: "RetireMSHR (with A_MakeUnique queued)" }
+  - { from: T_ACK_B__PEND_A_MakeUnique,                        event: COMPACK_B_CleanShared,                                         to: I__PEND_A_MakeUnique,                              action: "RetireMSHR (with A_MakeUnique queued)" }
+  - { from: T_ACK_B,                                           event: REQ_A_CleanShared__HAZARD,                                     to: T_ACK_B__PEND_A_CleanShared,                       action: "queue A_CleanShared; transient continues" }
+  - { from: T_ACK_B__PEND_A_CleanShared,                       event: COMPACK_B_ReadClean,                                           to: SC_B__PEND_A_CleanShared,                          action: "RetireMSHR (with A_CleanShared queued)" }
+  - { from: T_ACK_B__PEND_A_CleanShared,                       event: COMPACK_B_ReadUnique,                                          to: UC_B__PEND_A_CleanShared,                          action: "RetireMSHR (with A_CleanShared queued)" }
+  - { from: T_ACK_B__PEND_A_CleanShared,                       event: COMPACK_B_MakeUnique,                                          to: UC_B__PEND_A_CleanShared,                          action: "RetireMSHR (with A_CleanShared queued)" }
+  - { from: T_ACK_B__PEND_A_CleanShared,                       event: COMPACK_B_CleanUnique,                                         to: UC_B__PEND_A_CleanShared,                          action: "RetireMSHR (with A_CleanShared queued)" }
+  - { from: T_ACK_B__PEND_A_CleanShared,                       event: COMPACK_B_CleanInval,                                          to: I__PEND_A_CleanShared,                             action: "RetireMSHR (with A_CleanShared queued)" }
+  - { from: T_ACK_B__PEND_A_CleanShared,                       event: COMPACK_B_CleanShared,                                         to: I__PEND_A_CleanShared,                             action: "RetireMSHR (with A_CleanShared queued)" }
+  - { from: T_ACK_B,                                           event: REQ_A_CleanUnique__HAZARD,                                     to: T_ACK_B__PEND_A_CleanUnique,                       action: "queue A_CleanUnique; transient continues" }
+  - { from: T_ACK_B__PEND_A_CleanUnique,                       event: COMPACK_B_ReadClean,                                           to: SC_B__PEND_A_CleanUnique,                          action: "RetireMSHR (with A_CleanUnique queued)" }
+  - { from: T_ACK_B__PEND_A_CleanUnique,                       event: COMPACK_B_ReadUnique,                                          to: UC_B__PEND_A_CleanUnique,                          action: "RetireMSHR (with A_CleanUnique queued)" }
+  - { from: T_ACK_B__PEND_A_CleanUnique,                       event: COMPACK_B_MakeUnique,                                          to: UC_B__PEND_A_CleanUnique,                          action: "RetireMSHR (with A_CleanUnique queued)" }
+  - { from: T_ACK_B__PEND_A_CleanUnique,                       event: COMPACK_B_CleanUnique,                                         to: UC_B__PEND_A_CleanUnique,                          action: "RetireMSHR (with A_CleanUnique queued)" }
+  - { from: T_ACK_B__PEND_A_CleanUnique,                       event: COMPACK_B_CleanInval,                                          to: I__PEND_A_CleanUnique,                             action: "RetireMSHR (with A_CleanUnique queued)" }
+  - { from: T_ACK_B__PEND_A_CleanUnique,                       event: COMPACK_B_CleanShared,                                         to: I__PEND_A_CleanUnique,                             action: "RetireMSHR (with A_CleanUnique queued)" }
+  - { from: T_ACK_B,                                           event: REQ_A_CleanInvalid__HAZARD,                                    to: T_ACK_B__PEND_A_CleanInvalid,                      action: "queue A_CleanInvalid; transient continues" }
+  - { from: T_ACK_B__PEND_A_CleanInvalid,                      event: COMPACK_B_ReadClean,                                           to: SC_B__PEND_A_CleanInvalid,                         action: "RetireMSHR (with A_CleanInvalid queued)" }
+  - { from: T_ACK_B__PEND_A_CleanInvalid,                      event: COMPACK_B_ReadUnique,                                          to: UC_B__PEND_A_CleanInvalid,                         action: "RetireMSHR (with A_CleanInvalid queued)" }
+  - { from: T_ACK_B__PEND_A_CleanInvalid,                      event: COMPACK_B_MakeUnique,                                          to: UC_B__PEND_A_CleanInvalid,                         action: "RetireMSHR (with A_CleanInvalid queued)" }
+  - { from: T_ACK_B__PEND_A_CleanInvalid,                      event: COMPACK_B_CleanUnique,                                         to: UC_B__PEND_A_CleanInvalid,                         action: "RetireMSHR (with A_CleanInvalid queued)" }
+  - { from: T_ACK_B__PEND_A_CleanInvalid,                      event: COMPACK_B_CleanInval,                                          to: I__PEND_A_CleanInvalid,                            action: "RetireMSHR (with A_CleanInvalid queued)" }
+  - { from: T_ACK_B__PEND_A_CleanInvalid,                      event: COMPACK_B_CleanShared,                                         to: I__PEND_A_CleanInvalid,                            action: "RetireMSHR (with A_CleanInvalid queued)" }
+  - { from: T_ACK_B,                                           event: REQ_A_ReadNoSnp__HAZARD,                                       to: T_ACK_B__PEND_A_ReadNoSnp,                         action: "queue A_ReadNoSnp; transient continues" }
+  - { from: T_ACK_B__PEND_A_ReadNoSnp,                         event: COMPACK_B_ReadClean,                                           to: SC_B__PEND_A_ReadNoSnp,                            action: "RetireMSHR (with A_ReadNoSnp queued)" }
+  - { from: T_ACK_B__PEND_A_ReadNoSnp,                         event: COMPACK_B_ReadUnique,                                          to: UC_B__PEND_A_ReadNoSnp,                            action: "RetireMSHR (with A_ReadNoSnp queued)" }
+  - { from: T_ACK_B__PEND_A_ReadNoSnp,                         event: COMPACK_B_MakeUnique,                                          to: UC_B__PEND_A_ReadNoSnp,                            action: "RetireMSHR (with A_ReadNoSnp queued)" }
+  - { from: T_ACK_B__PEND_A_ReadNoSnp,                         event: COMPACK_B_CleanUnique,                                         to: UC_B__PEND_A_ReadNoSnp,                            action: "RetireMSHR (with A_ReadNoSnp queued)" }
+  - { from: T_ACK_B__PEND_A_ReadNoSnp,                         event: COMPACK_B_CleanInval,                                          to: I__PEND_A_ReadNoSnp,                               action: "RetireMSHR (with A_ReadNoSnp queued)" }
+  - { from: T_ACK_B__PEND_A_ReadNoSnp,                         event: COMPACK_B_CleanShared,                                         to: I__PEND_A_ReadNoSnp,                               action: "RetireMSHR (with A_ReadNoSnp queued)" }
+  - { from: T_ACK_B,                                           event: REQ_A_WriteNoSnpFull__HAZARD,                                  to: T_ACK_B__PEND_A_WriteNoSnpFull,                    action: "queue A_WriteNoSnpFull; transient continues" }
+  - { from: T_ACK_B__PEND_A_WriteNoSnpFull,                    event: COMPACK_B_ReadClean,                                           to: SC_B__PEND_A_WriteNoSnpFull,                       action: "RetireMSHR (with A_WriteNoSnpFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteNoSnpFull,                    event: COMPACK_B_ReadUnique,                                          to: UC_B__PEND_A_WriteNoSnpFull,                       action: "RetireMSHR (with A_WriteNoSnpFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteNoSnpFull,                    event: COMPACK_B_MakeUnique,                                          to: UC_B__PEND_A_WriteNoSnpFull,                       action: "RetireMSHR (with A_WriteNoSnpFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteNoSnpFull,                    event: COMPACK_B_CleanUnique,                                         to: UC_B__PEND_A_WriteNoSnpFull,                       action: "RetireMSHR (with A_WriteNoSnpFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteNoSnpFull,                    event: COMPACK_B_CleanInval,                                          to: I__PEND_A_WriteNoSnpFull,                          action: "RetireMSHR (with A_WriteNoSnpFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteNoSnpFull,                    event: COMPACK_B_CleanShared,                                         to: I__PEND_A_WriteNoSnpFull,                          action: "RetireMSHR (with A_WriteNoSnpFull queued)" }
+  - { from: T_ACK_B,                                           event: REQ_A_WriteBackFull__HAZARD,                                   to: T_ACK_B__PEND_A_WriteBackFull,                     action: "queue A_WriteBackFull; transient continues" }
+  - { from: T_ACK_B__PEND_A_WriteBackFull,                     event: COMPACK_B_ReadClean,                                           to: SC_B__PEND_A_WriteBackFull,                        action: "RetireMSHR (with A_WriteBackFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteBackFull,                     event: COMPACK_B_ReadUnique,                                          to: UC_B__PEND_A_WriteBackFull,                        action: "RetireMSHR (with A_WriteBackFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteBackFull,                     event: COMPACK_B_MakeUnique,                                          to: UC_B__PEND_A_WriteBackFull,                        action: "RetireMSHR (with A_WriteBackFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteBackFull,                     event: COMPACK_B_CleanUnique,                                         to: UC_B__PEND_A_WriteBackFull,                        action: "RetireMSHR (with A_WriteBackFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteBackFull,                     event: COMPACK_B_CleanInval,                                          to: I__PEND_A_WriteBackFull,                           action: "RetireMSHR (with A_WriteBackFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteBackFull,                     event: COMPACK_B_CleanShared,                                         to: I__PEND_A_WriteBackFull,                           action: "RetireMSHR (with A_WriteBackFull queued)" }
+  - { from: T_ACK_B,                                           event: REQ_A_WriteCleanFull__HAZARD,                                  to: T_ACK_B__PEND_A_WriteCleanFull,                    action: "queue A_WriteCleanFull; transient continues" }
+  - { from: T_ACK_B__PEND_A_WriteCleanFull,                    event: COMPACK_B_ReadClean,                                           to: SC_B__PEND_A_WriteCleanFull,                       action: "RetireMSHR (with A_WriteCleanFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteCleanFull,                    event: COMPACK_B_ReadUnique,                                          to: UC_B__PEND_A_WriteCleanFull,                       action: "RetireMSHR (with A_WriteCleanFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteCleanFull,                    event: COMPACK_B_MakeUnique,                                          to: UC_B__PEND_A_WriteCleanFull,                       action: "RetireMSHR (with A_WriteCleanFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteCleanFull,                    event: COMPACK_B_CleanUnique,                                         to: UC_B__PEND_A_WriteCleanFull,                       action: "RetireMSHR (with A_WriteCleanFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteCleanFull,                    event: COMPACK_B_CleanInval,                                          to: I__PEND_A_WriteCleanFull,                          action: "RetireMSHR (with A_WriteCleanFull queued)" }
+  - { from: T_ACK_B__PEND_A_WriteCleanFull,                    event: COMPACK_B_CleanShared,                                         to: I__PEND_A_WriteCleanFull,                          action: "RetireMSHR (with A_WriteCleanFull queued)" }
+  - { from: SC_AB__PEND_B_CleanUnique,                         event: AUTO_START_B_CleanUnique,                                      to: T_SNP_B,                                           action: "in-flight retired; start queued B_CleanUnique" }
+  - { from: SC_AB__PEND_A_CleanUnique,                         event: AUTO_START_A_CleanUnique,                                      to: T_SNP_A,                                           action: "in-flight retired; start queued A_CleanUnique" }
+  - { from: SC_A__PEND_B_ReadClean,                            event: AUTO_START_B_ReadClean,                                        to: T_SNP_B,                                           action: "in-flight retired; start queued B_ReadClean" }
+  - { from: UC_A__PEND_B_ReadClean,                            event: AUTO_START_B_ReadClean,                                        to: T_SNP_B,                                           action: "in-flight retired; start queued B_ReadClean" }
+  - { from: I__PEND_B_ReadClean,                               event: AUTO_START_B_ReadClean,                                        to: T_FILL_B,                                          action: "in-flight retired; start queued B_ReadClean" }
+  - { from: SC_A__PEND_B_ReadUnique,                           event: AUTO_START_B_ReadUnique,                                       to: T_SNP_B,                                           action: "in-flight retired; start queued B_ReadUnique" }
+  - { from: UC_A__PEND_B_ReadUnique,                           event: AUTO_START_B_ReadUnique,                                       to: T_SNP_B,                                           action: "in-flight retired; start queued B_ReadUnique" }
+  - { from: I__PEND_B_ReadUnique,                              event: AUTO_START_B_ReadUnique,                                       to: T_FILL_B,                                          action: "in-flight retired; start queued B_ReadUnique" }
+  - { from: SC_A__PEND_B_MakeUnique,                           event: AUTO_START_B_MakeUnique,                                       to: T_SNP_B,                                           action: "in-flight retired; start queued B_MakeUnique" }
+  - { from: I__PEND_B_MakeUnique,                              event: AUTO_START_B_MakeUnique,                                       to: T_ACK_B,                                           action: "in-flight retired; start queued B_MakeUnique" }
+  - { from: SC_A__PEND_B_CleanShared,                          event: AUTO_START_B_CleanShared,                                      to: T_SNP_B,                                           action: "in-flight retired; start queued B_CleanShared" }
+  - { from: UC_A__PEND_B_CleanShared,                          event: AUTO_START_B_CleanShared,                                      to: T_SNP_B,                                           action: "in-flight retired; start queued B_CleanShared" }
+  - { from: I__PEND_B_CleanShared,                             event: AUTO_START_B_CleanShared,                                      to: T_ACK_B,                                           action: "in-flight retired; start queued B_CleanShared" }
+  - { from: SC_A__PEND_B_CleanUnique,                          event: AUTO_START_B_CleanUnique,                                      to: T_SNP_B,                                           action: "in-flight retired; start queued B_CleanUnique" }
+  - { from: SC_A__PEND_B_CleanInvalid,                         event: AUTO_START_B_CleanInvalid,                                     to: T_SNP_B,                                           action: "in-flight retired; start queued B_CleanInvalid" }
+  - { from: I__PEND_B_ReadNoSnp,                               event: AUTO_START_B_ReadNoSnp,                                        to: I,                                                 action: "in-flight retired; start queued B_ReadNoSnp" }
+  - { from: I__PEND_B_WriteNoSnpFull,                          event: AUTO_START_B_WriteNoSnpFull,                                   to: I,                                                 action: "in-flight retired; start queued B_WriteNoSnpFull" }
+  - { from: SC_B__PEND_A_ReadClean,                            event: AUTO_START_A_ReadClean,                                        to: T_SNP_A,                                           action: "in-flight retired; start queued A_ReadClean" }
+  - { from: UC_B__PEND_A_ReadClean,                            event: AUTO_START_A_ReadClean,                                        to: T_SNP_A,                                           action: "in-flight retired; start queued A_ReadClean" }
+  - { from: I__PEND_A_ReadClean,                               event: AUTO_START_A_ReadClean,                                        to: T_FILL_A,                                          action: "in-flight retired; start queued A_ReadClean" }
+  - { from: SC_B__PEND_A_ReadUnique,                           event: AUTO_START_A_ReadUnique,                                       to: T_SNP_A,                                           action: "in-flight retired; start queued A_ReadUnique" }
+  - { from: UC_B__PEND_A_ReadUnique,                           event: AUTO_START_A_ReadUnique,                                       to: T_SNP_A,                                           action: "in-flight retired; start queued A_ReadUnique" }
+  - { from: I__PEND_A_ReadUnique,                              event: AUTO_START_A_ReadUnique,                                       to: T_FILL_A,                                          action: "in-flight retired; start queued A_ReadUnique" }
+  - { from: SC_B__PEND_A_MakeUnique,                           event: AUTO_START_A_MakeUnique,                                       to: T_SNP_A,                                           action: "in-flight retired; start queued A_MakeUnique" }
+  - { from: I__PEND_A_MakeUnique,                              event: AUTO_START_A_MakeUnique,                                       to: T_ACK_A,                                           action: "in-flight retired; start queued A_MakeUnique" }
+  - { from: SC_B__PEND_A_CleanShared,                          event: AUTO_START_A_CleanShared,                                      to: T_SNP_A,                                           action: "in-flight retired; start queued A_CleanShared" }
+  - { from: UC_B__PEND_A_CleanShared,                          event: AUTO_START_A_CleanShared,                                      to: T_SNP_A,                                           action: "in-flight retired; start queued A_CleanShared" }
+  - { from: I__PEND_A_CleanShared,                             event: AUTO_START_A_CleanShared,                                      to: T_ACK_A,                                           action: "in-flight retired; start queued A_CleanShared" }
+  - { from: SC_B__PEND_A_CleanUnique,                          event: AUTO_START_A_CleanUnique,                                      to: T_SNP_A,                                           action: "in-flight retired; start queued A_CleanUnique" }
+  - { from: SC_B__PEND_A_CleanInvalid,                         event: AUTO_START_A_CleanInvalid,                                     to: T_SNP_A,                                           action: "in-flight retired; start queued A_CleanInvalid" }
+  - { from: I__PEND_A_ReadNoSnp,                               event: AUTO_START_A_ReadNoSnp,                                        to: I,                                                 action: "in-flight retired; start queued A_ReadNoSnp" }
+  - { from: I__PEND_A_WriteNoSnpFull,                          event: AUTO_START_A_WriteNoSnpFull,                                   to: I,                                                 action: "in-flight retired; start queued A_WriteNoSnpFull" }

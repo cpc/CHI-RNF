@@ -1,0 +1,37 @@
+package:
+  name: chi-rnf
+  authors:
+    - "Teemu Rinne <teemu.rinne@tuni.fi>"
+    - "Abdesattar Kalache <abdesattar.kalache@tuni.fi>"
+  version: 0.1.0
+
+include_dirs:
+  - cva6-RNF/cache/include/
+  - cva6-RNF/cache/rnf_link/include/
+
+sources:
+  # Level 0: Global Parameters and Defines (Parsed First)
+  - files:
+      - cva6-RNF/cache/include/rnf_param.v
+      - cva6-RNF/cache/include/rnf_defines.v
+      - cva6-RNF/cache/include/chie_defines.v
+
+  # Level 1: Link Layer Modules
+  - files:
+      - cva6-RNF/cache/rnf_link/rnf_link_txdat_wrap.v
+      - cva6-RNF/cache/rnf_link/rnf_link_rxdat_parse.v
+      - cva6-RNF/cache/rnf_link/rnf_link_txrsp_wrap.v
+      - cva6-RNF/cache/rnf_link/rnf_link_rxrsp_parse.v
+      - cva6-RNF/cache/rnf_link/rnf_link_txreq_wrap.v
+      - cva6-RNF/cache/rnf_link/rnf_link_rxsnp_parse.v
+      - cva6-RNF/cache/rnf_link/rnf_link_handshake_ctl.v
+      - cva6-RNF/cache/rnf_link/rnf_link.v
+
+  # Level 2: L15 Cache and Control Logic
+  - files:
+      - cva6-RNF/cache/l15/rtl/l15_wrap_rnf.v
+      - cva6-RNF/cache/l15/rtl/l15_rnf.v
+      - cva6-RNF/cache/l15/rtl/txreq_encoder.v
+      - cva6-RNF/cache/l15/rtl/response_encoder.sv
+      - cva6-RNF/cache/l15/rtl/request_register.sv
+      - cva6-RNF/cache/l15/rtl/rx_control.sv

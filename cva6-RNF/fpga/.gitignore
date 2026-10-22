@@ -1,0 +1,8 @@
+build/
+ip/clk_wiz_0/
+ip/mig_ddr4_0/
+*.jou
+*.log
+*.str
+*.backup.*
+.Xil/

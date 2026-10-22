@@ -1,0 +1,66 @@
+*~
+transcript
+*.log
+*.img
+*.tpef*
+*.dump
+wlf*
+*.dot
+*.pyc
+*.diff
+*.elf*
+*.disasm
+*.hex*
+*.asm
+*_trace*
+vsim.wlf
+work
+compile_log
+compile_log.txt
+prog_compilation.txt
+*parsedRTLTrace.txt
+*parsedSimulatorTrace.txt
+patara
+
+# Modelsim / Questa runtime artifacts
+modelsim.ini
+*.vstf
+*.wlf
+etch*
+cva6-RNF/tb/questa_build/
+cva6-RNF/tb/*.do
+!cva6-RNF/tb/phys_bug_wave.do
+cva6-RNF/chi_systemc
+cva6-RNF/chi_systemc.do
+
+# testgen runtime outputs
+cva6-RNF/tb/testgen/vectors/
+cva6-RNF/tb/testgen/vectors_murphi/
+cva6-RNF/tb/testgen/vectors_rnf/
+cva6-RNF/tb/testgen/run_all_logs/
+cva6-RNF/tb/testgen/run_all_rnf_logs/
+cva6-RNF/tb/testgen/run_all_summary.tsv
+cva6-RNF/tb/testgen/murphi_summary.tsv
+cva6-RNF/tb/testgen/coverage.txt
+cva6-RNF/tb/testgen/*.ucdb
+cva6-RNF/tb/testgen/coverage_html/
+cva6-RNF/tb/testgen/murphi/hnf_fsm
+cva6-RNF/tb/testgen/murphi/hnf_fsm.c
+cva6-RNF/tb/testgen/murphi/hnf_fsm_v2
+cva6-RNF/tb/testgen/murphi/hnf_fsm_v2.c
+cva6-RNF/tb/testgen/murphi_rnf/rnf_fsm
+cva6-RNF/tb/testgen/murphi_rnf/rnf_fsm.c
+cva6-RNF/tb/testgen/murphi/*.bak
+cva6-RNF/tb/testgen/*.png
+cva6-RNF/tb/testgen/murphi/*.png
+
+# Repo-root build/scratch
+questa_build/
+.claude/
+
+# SW build outputs
+sw/bootrom.bin
+cva6-RNF/sw/build/
+
+# Screenshots / scratch
+cva6-RNF/tb/spread.png
